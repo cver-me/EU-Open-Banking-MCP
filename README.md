@@ -4,8 +4,6 @@ A self-hosted, read-only MCP server for accessing personal European bank account
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cver-me/eu-open-banking-mcp)
 
-This is not a generic Open Banking proxy. MCP clients can list authorized accounts, read balances and transactions, search transaction text, and summarize cash flow. They cannot select arbitrary provider endpoints, authorize or remove bank sessions, or initiate payments.
-
 > [!IMPORTANT]
 > Treat every deployment as a private financial system. The repository is open source; your Worker, MCP URL, secrets, session IDs, account IDs, and financial data are private.
 
@@ -13,7 +11,7 @@ This is not a generic Open Banking proxy. MCP clients can list authorized accoun
 
 [ChatGPT Finances](https://openai.com/index/personal-finance-chatgpt/) shows what becomes possible when an assistant can reason over real balances and transactions. Its account connection is powered by Plaid and is currently available in the United States.
 
-We built this project because we could not find a comparably direct, self-hostable path for European personal accounts. Europe has Open Banking, but individuals still reach bank data through regulated providers whose production onboarding and APIs vary. [Plaid's published MCP servers](https://plaid.com/docs/resources/mcp/) are useful for developer tooling and production diagnostics; they do not expose a person's balances and transactions as personal-finance MCP tools.
+I built this project because I could not find a comparably direct, self-hostable path for European personal accounts. Europe has Open Banking, but individuals still reach bank data through regulated providers whose production onboarding and APIs vary. [Plaid's published MCP servers](https://plaid.com/docs/resources/mcp/) are useful for developer tooling and production diagnostics; they do not expose a person's balances and transactions as personal-finance MCP tools.
 
 This project fills that narrow gap: one person deploys one private MCP, authorizes only their own bank accounts, and lets their chosen MCP clients perform bounded read-only analysis. It is infrastructure for personal use, not a hosted financial product or a multi-user aggregator.
 
@@ -110,20 +108,21 @@ Use the **Deploy to Cloudflare** button above. Cloudflare's deploy flow will:
 1. copy the repository into the user's GitHub or GitLab account;
 2. ask for `ENABLE_BANKING_APPLICATION_ID` and `ENABLE_BANKING_PRIVATE_KEY_PEM`;
 3. provision the `SESSION_STORE` KV namespace;
-4. build and deploy the Worker with Workers Builds.
+4. attach the Cloudflare Access policy required by this project;
+5. build and deploy the Worker with Workers Builds.
+
+The two secret fields initially contain masked placeholder values read from `.dev.vars.example`: an all-zero UUID and a `replace-me` private key. They are not existing credentials. Replace both fields with the production application UUID and private key before deploying.
+
+Cloudflare presents Access as optional because Workers can be public, but it is required by this project. On the deployment page, enable **Protect with Cloudflare Access**, choose **All traffic**, and add an authentication policy. For a personal deployment, allow only your exact identity (or your Cloudflare account if only trusted members belong to it). **Previews only** does not protect the production Worker.
 
 Cloudflare documents this behavior in [Deploy to Cloudflare buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 
-### 3. Protect the Worker
+### 3. Enable Managed OAuth
 
-1. Open Workers & Pages → your Worker → **Access** → **Protect this Worker behind Access**.
-2. Choose **All traffic** and restrict the policy to your Cloudflare account or your exact identity.
-3. Open Zero Trust → Access controls → Applications → the new Worker application → **Advanced settings**.
-4. Enable **Managed OAuth** and save.
+1. Open Zero Trust → Access controls → Applications → the Access application created during deployment.
+2. Open **Advanced settings**, enable **Managed OAuth**, and save.
 
-Until Worker-level Access is attached, the Worker fails closed with `403 access_required` because Cloudflare did not provide `ctx.access`. Worker-level Access protects `/`, `/setup`, `/callback`, and `/mcp` across the Worker's associated domains. See Cloudflare's [Worker-level Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
-
-Cloudflare Access is intentionally a post-deployment step. Deploy to Cloudflare currently provisions Worker resources such as KV, but not Access applications. Automating it would require every installer to create and provide a broader `Access: Apps and Policies Write` API token. The dashboard step keeps that permission out of the Worker and its build.
+If **Protect with Cloudflare Access** was not enabled during deployment, attach Worker-level Access manually before continuing. Until Access is attached, the Worker fails closed with `403 access_required` because Cloudflare did not provide `ctx.access`. Worker-level Access protects `/`, `/setup`, `/callback`, and `/mcp` across the Worker's associated domains. See Cloudflare's [Worker-level Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
 
 Managed OAuth exposes the protected-resource and authorization-server discovery metadata used by MCP clients. Cloudflare validates the request before Worker invocation; this project does not duplicate Cloudflare's JWT verifier.
 
@@ -143,37 +142,6 @@ Use this MCP URL:
 ```text
 https://<your-worker>.workers.dev/mcp
 ```
-
-## Manual development and deployment
-
-Install dependencies and create local secrets:
-
-```sh
-bun install --frozen-lockfile
-cp .dev.vars.example .dev.vars
-```
-
-Fill in the Enable Banking application UUID and private key. Keep PEM line breaks as `\n` inside the quoted value. Never commit `.dev.vars`.
-
-Start locally:
-
-```sh
-bun run dev
-```
-
-Wrangler supplies a simulated Access identity from `access.dev`. Local KV data remains under `.wrangler`. To exercise bank authorization locally, `http://localhost:8787/callback` must be registered in the Enable Banking application.
-
-For a manual production deployment, create a KV namespace, add its ID to the `SESSION_STORE` binding if Wrangler requests it, set the two secrets, and deploy:
-
-```sh
-bunx wrangler kv namespace create SESSION_STORE
-bunx wrangler secret put ENABLE_BANKING_APPLICATION_ID
-bunx wrangler secret put ENABLE_BANKING_PRIVATE_KEY_PEM
-bun run check
-bun run deploy
-```
-
-The Deploy to Cloudflare path provisions KV automatically; the manual path may require copying the namespace ID printed by Wrangler into `wrangler.jsonc`.
 
 ## Verification
 
