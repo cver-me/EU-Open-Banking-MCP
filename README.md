@@ -1,6 +1,8 @@
-# Personal Finance EU MCP
+# EU Open Banking MCP
 
-A private, self-hosted, read-only MCP server for personal European banking data. It runs on Cloudflare Workers and currently uses [Enable Banking](https://enablebanking.com/) as its provider.
+A self-hosted, read-only MCP server for accessing personal European bank accounts through [Enable Banking](https://enablebanking.com/), secured and deployed on Cloudflare Workers.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cver-me/eu-open-banking-mcp)
 
 This is not a generic Open Banking proxy. MCP clients can list authorized accounts, read balances and transactions, search transaction text, and summarize cash flow. They cannot select arbitrary provider endpoints, authorize or remove bank sessions, or initiate payments.
 
@@ -103,7 +105,7 @@ This repository is intended for personal, non-commercial use. Confirm that your 
 
 ### 2. Deploy to Cloudflare
 
-The README deploy button will be added when the repository is public. Cloudflare's deploy flow will:
+Use the **Deploy to Cloudflare** button above. Cloudflare's deploy flow will:
 
 1. copy the repository into the user's GitHub or GitLab account;
 2. ask for `ENABLE_BANKING_APPLICATION_ID` and `ENABLE_BANKING_PRIVATE_KEY_PEM`;
