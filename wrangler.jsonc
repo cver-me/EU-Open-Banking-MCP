@@ -1,0 +1,40 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "finance",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-23",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Worker-level Access protects every route, including workers.dev.
+  // The in-code ctx.access check fails closed before that policy is attached.
+  "workers_dev": true,
+  "preview_urls": false,
+
+  // Simulate the platform-provided Access context only in local development.
+  "access": {
+    "dev": {
+      "aud": "local-development",
+      "identity": { "email": "owner@example.invalid" }
+    }
+  },
+
+  // Deploy buttons provision this namespace automatically. It stores only
+  // Enable Banking session IDs created through the protected setup flow.
+  "kv_namespaces": [{ "binding": "SESSION_STORE" }],
+
+  // Values are never stored here. Wrangler uses these declarations for
+  // generated types and refuses a deployment when a secret is missing.
+  "secrets": {
+    "required": [
+      "ENABLE_BANKING_APPLICATION_ID",
+      "ENABLE_BANKING_PRIVATE_KEY_PEM"
+    ]
+  },
+
+  // Code logs metadata only; financial payloads and upstream bodies are never logged.
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1.0 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  }
+}

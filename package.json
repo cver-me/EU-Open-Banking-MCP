@@ -1,0 +1,42 @@
+{
+  "name": "personal-finance-eu-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "bun@1.4.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "types": "wrangler types --strict-vars false",
+    "typecheck": "bun run types && tsc --noEmit",
+    "test": "vitest run",
+    "check": "bun run typecheck && bun run test && wrangler deploy --dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "cloudflare": {
+    "bindings": {
+      "ENABLE_BANKING_APPLICATION_ID": {
+        "description": "Application UUID from your Enable Banking production application."
+      },
+      "ENABLE_BANKING_PRIVATE_KEY_PEM": {
+        "description": "Private RSA key matching the certificate uploaded to Enable Banking. Keep the PEM header, footer, and line breaks."
+      },
+      "SESSION_STORE": {
+        "description": "Automatically provisioned KV namespace containing only authorized Enable Banking session IDs."
+      }
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "0.21.0",
+    "decimal.js": "10.6.0",
+    "jose": "6.2.10",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.0.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  }
+}
