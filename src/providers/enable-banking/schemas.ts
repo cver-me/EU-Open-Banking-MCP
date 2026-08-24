@@ -173,6 +173,7 @@ const transactionSchema = z.object({
   status: z.enum(ENABLE_BANKING_TRANSACTION_STATUSES),
   booking_date: optionalProviderField(isoDateSchema),
   value_date: optionalProviderField(isoDateSchema),
+  transaction_date: optionalProviderField(isoDateSchema),
   creditor: optionalProviderField(partyIdentificationSchema),
   debtor: optionalProviderField(partyIdentificationSchema),
   merchant_category_code: optionalProviderField(z.string()),

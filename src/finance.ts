@@ -100,9 +100,16 @@ export const transactionSchema = z.object({
     .enum(["credit", "debit"])
     .describe("credit adds funds to the account; debit removes funds from the account"),
   status: transactionStatusSchema.describe("Normalized lifecycle status of the transaction"),
+  transactionDate: isoDateSchema
+    .optional()
+    .describe(
+      "Bank-reported date when the payment or transaction occurred; use this for questions about when the user spent or paid",
+    ),
   bookingDate: isoDateSchema
     .optional()
-    .describe("Date the transaction was recorded on the account books"),
+    .describe(
+      "Accounting date the transaction was recorded on the account books; not the date the user made the payment",
+    ),
   valueDate: isoDateSchema
     .optional()
     .describe("Date the funds became available for a credit or ceased to be available for a debit"),

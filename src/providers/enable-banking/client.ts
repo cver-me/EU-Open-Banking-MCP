@@ -612,6 +612,9 @@ function normalizeTransaction(accountId: string, transaction: EnableBankingTrans
     currency: transaction.transaction_amount.currency,
     direction: credit ? ("credit" as const) : ("debit" as const),
     status: TRANSACTION_STATUSES[transaction.status],
+    ...(transaction.transaction_date === undefined
+      ? {}
+      : { transactionDate: transaction.transaction_date }),
     ...(transaction.booking_date === undefined ? {} : { bookingDate: transaction.booking_date }),
     ...(transaction.value_date === undefined ? {} : { valueDate: transaction.value_date }),
     ...(counterparty === undefined ? {} : { counterparty }),

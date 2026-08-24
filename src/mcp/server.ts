@@ -26,6 +26,7 @@ const MAX_TRANSACTIONS_PER_RESULT = 200;
 const MAX_SEARCH_PAGES = 5;
 const MAX_SUMMARY_PAGES = 20;
 const MAX_SUMMARY_TRANSACTIONS = 10_000;
+const SPENDING_STATUSES = new Set<TransactionStatus>(["booked", "held", "other", "pending"]);
 
 const annotations = {
   readOnlyHint: true,
@@ -59,6 +60,15 @@ const transactionFiltersSchema = dateRangeSchema.extend({
   status: transactionStatusSchema
     .optional()
     .describe("Optional normalized transaction status filter"),
+});
+
+const spendingDateRangeSchema = dateRangeSchema.safeExtend({
+  dateFrom: isoDateSchema.describe(
+    "Inclusive first transaction date in YYYY-MM-DD format",
+  ),
+  dateTo: isoDateSchema.describe(
+    "Inclusive last transaction date in YYYY-MM-DD format",
+  ),
 });
 
 interface PageCursor {
@@ -130,11 +140,120 @@ export function createFinanceServer(
   );
 
   server.registerTool(
+    "finance_get_spending",
+    {
+      title: "Get spending",
+      description:
+        "Return debit spending by transaction date for a date range, across all accounts by default. Includes pending transactions and returns exact totals with the matching transaction records.",
+      inputSchema: spendingDateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
+      outputSchema: z.object({
+        totalsByCurrency: z.record(
+          currencySchema,
+          nonNegativeDecimalAmountSchema.describe(
+            "Exact total of matching debit activity in this currency",
+          ),
+        ),
+        transactions: z
+          .array(transactionSchema)
+          .describe("Matching debit transactions, capped at 200 records"),
+        transactionsIncluded: z
+          .number()
+          .int()
+          .describe("Number of matching transactions included in the totals"),
+        transactionDetailsComplete: z
+          .boolean()
+          .describe("True when every transaction included in the totals is returned in transactions"),
+        dateCoverageComplete: z
+          .boolean()
+          .describe("True when every potentially relevant debit returned by the bank had a transactionDate"),
+        complete: z
+          .boolean()
+          .describe("True only when all selected accounts and provider pages were scanned"),
+        pagesScanned: z.number().int().describe("Total provider pages scanned"),
+      }),
+      annotations,
+    },
+    async ({ accountId, dateFrom, dateTo }) =>
+      safeResult(async () => {
+        const accountIds = accountId === undefined ? await provider.listAccountIds() : [accountId];
+        const totals = new Map<string, Decimal>();
+        const transactions: Transaction[] = [];
+        let transactionsIncluded = 0;
+        let transactionsScanned = 0;
+        let pagesScanned = 0;
+        let dateCoverageComplete = true;
+        let complete = true;
+
+        outer: for (const accountId of accountIds) {
+          if (pagesScanned >= MAX_SUMMARY_PAGES) {
+            complete = false;
+            break;
+          }
+          let continuationKey: string | undefined;
+          do {
+            const page = await provider.listTransactions(accountId, {
+              dateFrom,
+              dateTo,
+              ...(continuationKey === undefined ? {} : { continuationKey }),
+            });
+            pagesScanned += 1;
+            for (const transaction of page.transactions) {
+              transactionsScanned += 1;
+              if (
+                transaction.direction === "debit" &&
+                SPENDING_STATUSES.has(transaction.status)
+              ) {
+                if (transaction.transactionDate === undefined) {
+                  dateCoverageComplete = false;
+                } else if (
+                  transaction.transactionDate >= dateFrom &&
+                  transaction.transactionDate <= dateTo
+                ) {
+                  totals.set(
+                    transaction.currency,
+                    (totals.get(transaction.currency) ?? new Decimal(0)).plus(
+                      transaction.amount,
+                    ),
+                  );
+                  transactionsIncluded += 1;
+                  if (transactions.length < MAX_TRANSACTIONS_PER_RESULT) {
+                    transactions.push(transaction);
+                  }
+                }
+              }
+              if (transactionsScanned >= MAX_SUMMARY_TRANSACTIONS) {
+                complete = false;
+                break outer;
+              }
+            }
+            continuationKey = page.continuationKey;
+            if (pagesScanned >= MAX_SUMMARY_PAGES && continuationKey !== undefined) {
+              complete = false;
+              break outer;
+            }
+          } while (continuationKey !== undefined);
+        }
+
+        return {
+          totalsByCurrency: Object.fromEntries(
+            [...totals.entries()].map(([currency, total]) => [currency, total.toFixed()]),
+          ),
+          transactions,
+          transactionsIncluded,
+          transactionDetailsComplete: transactions.length === transactionsIncluded,
+          dateCoverageComplete,
+          complete,
+          pagesScanned,
+        };
+      }),
+  );
+
+  server.registerTool(
     "finance_list_transactions",
     {
       title: "List transactions",
       description:
-        "List a bounded page of normalized transactions for a discovered account ID and date range. Use nextCursor to continue.",
+        "Return a paginated page of bank-reported transaction records for one account, optionally filtered by lifecycle status.",
       inputSchema: transactionFiltersSchema.extend({
         accountId: accountIdSchema,
         limit: z
@@ -280,7 +399,7 @@ export function createFinanceServer(
     {
       title: "Summarize cash flow",
       description:
-        "Sum booked credits, debits, and net cash flow with exact decimal arithmetic. Totals stay separated by currency.",
+        "Return booked credit, debit, and net accounting totals by currency for a date range.",
       inputSchema: dateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
       outputSchema: z.object({
         totalsByCurrency: z.record(
