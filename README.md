@@ -65,7 +65,7 @@ Pagination `nextCursor` values contain encoded continuation state; they are opaq
 
 Every tool is read-only, non-destructive, and idempotent. Provider codes are normalized into descriptive values such as `interim_available`, `booked`, and `professional`. Multiple balances for one account are alternative measurements and must never be added together. Monetary calculations use decimal arithmetic and never combine currencies.
 
-For everyday questions about what or how much the user spent, paid, or bought on a date, `finance_get_spending` scans all active accounts unless one is selected. It uses the bank-reported transaction date when supplied. For pending or held activity without that optional field, it trusts the bank's placement in the requested date range rather than treating a booked entry's later accounting date as the payment date. `finance_summarize_cash_flow` remains intentionally limited to booked accounting entries.
+For everyday questions about what or how much the user spent, paid, or bought on a date, `finance_get_spending` scans all active accounts unless one is selected. It uses the bank-reported transaction date when supplied. For pending or held activity without that optional field, it trusts the bank's placement in the requested date range rather than treating a booked entry's later accounting date as the payment date. Its `complete` field is false when scan limits or missing occurrence metadata prevent a full result. `finance_summarize_cash_flow` remains intentionally limited to booked accounting entries.
 
 For a complete balance refresh, call `finance_get_balances` once without an `accountId`. It discovers
 all active sessions itself, so a preceding `finance_list_accounts` call is unnecessary. The response

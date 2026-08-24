@@ -42,6 +42,31 @@ function fetchAuthenticated(request: Request, workerEnv: Env = env): Promise<Res
   );
 }
 
+function callTool(
+  id: number,
+  name: string,
+  args: Record<string, unknown>,
+  workerEnv: Env = env,
+): Promise<Response> {
+  return fetchAuthenticated(
+    new Request("https://localhost/mcp", {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        Host: "localhost",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }),
+    }),
+    workerEnv,
+  );
+}
+
 describe("Worker boundary", () => {
   it("serves the minimal setup page only after Access authentication", async () => {
     const response = await fetchAuthenticated(new Request("https://localhost/setup"));
@@ -121,6 +146,7 @@ describe("Worker boundary", () => {
             properties?: Record<
               string,
               {
+                description?: string;
                 items?: {
                   properties?: Record<string, { enum?: string[]; description?: string }>;
                 };
@@ -185,6 +211,10 @@ describe("Worker boundary", () => {
     const spendingTool = payload.result.tools.find(({ name }) => name === "finance_get_spending");
     expect(spendingTool?.description).toContain("debit spending for a date range");
     expect(spendingTool?.description).toContain("includes pending transactions");
+    expect(spendingTool?.outputSchema?.properties).not.toHaveProperty("dateCoverageComplete");
+    expect(spendingTool?.outputSchema?.properties?.complete?.description).toContain(
+      "fully determined",
+    );
 
     expect(transactionTool?.description).toContain("for one account");
     expect(transactionTool?.description).toContain("filtered by lifecycle status");
@@ -242,6 +272,12 @@ describe("Worker boundary", () => {
         return Response.json({
           transactions: [
             {
+              transaction_amount: { amount: "0.00", currency: "EUR" },
+              credit_debit_indicator: "DBIT",
+              status: "BOOK",
+              booking_date: "2026-08-24",
+            },
+            {
               transaction_amount: { amount: "-3.70", currency: "EUR" },
               credit_debit_indicator: "DBIT",
               status: "PDNG",
@@ -255,24 +291,10 @@ describe("Worker boundary", () => {
       return Response.json({ error: "unexpected_test_request" }, { status: 500 });
     });
 
-    const response = await fetchAuthenticated(
-      new Request("https://localhost/mcp", {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-          Host: "localhost",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 3,
-          method: "tools/call",
-          params: {
-            name: "finance_get_spending",
-            arguments: { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
-          },
-        }),
-      }),
+    const response = await callTool(
+      3,
+      "finance_get_spending",
+      { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
       {
         ...env,
         ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
@@ -298,12 +320,62 @@ describe("Worker boundary", () => {
       ],
       transactionsIncluded: 1,
       transactionDetailsComplete: true,
-      dateCoverageComplete: false,
       complete: true,
       pagesScanned: 2,
     });
     expect(JSON.stringify(payload)).not.toContain("Licari Group");
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("marks spending incomplete when a booked debit has no occurrence date", async () => {
+    await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/sessions/${INTESA_SESSION_ID}`) {
+        return Response.json({
+          status: "AUTHORIZED",
+          accounts: [INTESA_ACCOUNT_ID],
+          aspsp: { name: "Intesa Sanpaolo", country: "IT" },
+          psu_type: "personal",
+        });
+      }
+      expect(url.pathname).toBe(`/accounts/${INTESA_ACCOUNT_ID}/transactions`);
+      return Response.json({
+        transactions: [
+          {
+            transaction_amount: { amount: "-5.00", currency: "EUR" },
+            credit_debit_indicator: "DBIT",
+            status: "BOOK",
+            booking_date: "2026-08-24",
+          },
+        ],
+        continuation_key: null,
+      });
+    });
+
+    const response = await callTool(
+      4,
+      "finance_get_spending",
+      { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
+      {
+        ...env,
+        ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const payload = parseSsePayload(await response.text()) as {
+      result: { structuredContent: Record<string, unknown> };
+    };
+    expect(payload.result.structuredContent).toEqual({
+      totalsByCurrency: {},
+      transactions: [],
+      transactionsIncluded: 0,
+      transactionDetailsComplete: true,
+      complete: false,
+      pagesScanned: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("summarizes booked cash flow across provider pages", async () => {
@@ -345,24 +417,10 @@ describe("Worker boundary", () => {
       });
     });
 
-    const response = await fetchAuthenticated(
-      new Request("https://localhost/mcp", {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-          Host: "localhost",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 4,
-          method: "tools/call",
-          params: {
-            name: "finance_summarize_cash_flow",
-            arguments: { dateFrom: "2026-08-01", dateTo: "2026-08-24" },
-          },
-        }),
-      }),
+    const response = await callTool(
+      5,
+      "finance_summarize_cash_flow",
+      { dateFrom: "2026-08-01", dateTo: "2026-08-24" },
       {
         ...env,
         ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
@@ -383,29 +441,11 @@ describe("Worker boundary", () => {
 
   it("rejects a future transaction start date before contacting Enable Banking", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
-    const response = await fetchAuthenticated(
-      new Request("https://localhost/mcp", {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-          Host: "localhost",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 2,
-          method: "tools/call",
-          params: {
-            name: "finance_list_transactions",
-            arguments: {
-              accountId: "11111111-1111-4111-8111-111111111111",
-              dateFrom: "9999-01-01",
-              dateTo: "9999-01-02",
-            },
-          },
-        }),
-      }),
-    );
+    const response = await callTool(2, "finance_list_transactions", {
+      accountId: "11111111-1111-4111-8111-111111111111",
+      dateFrom: "9999-01-01",
+      dateTo: "9999-01-02",
+    });
 
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("dateFrom must not be in the future");

@@ -154,12 +154,9 @@ export function createFinanceServer(
         transactionDetailsComplete: z
           .boolean()
           .describe("True when every transaction included in the totals is returned in transactions"),
-        dateCoverageComplete: z
-          .boolean()
-          .describe("True when every potentially relevant debit returned by the bank had a transactionDate"),
         complete: z
           .boolean()
-          .describe("True only when all selected accounts and provider pages were scanned"),
+          .describe("True when spending for the requested range was fully determined"),
         pagesScanned: z.number().int().describe("Total provider pages scanned"),
       }),
       annotations,
@@ -170,7 +167,7 @@ export function createFinanceServer(
         const totals = new Map<string, Decimal>();
         const transactions: Transaction[] = [];
         let transactionsIncluded = 0;
-        let dateCoverageComplete = true;
+        let occurrenceCoverageComplete = true;
 
         const scan = await scanSummaryTransactions(
           provider,
@@ -183,19 +180,22 @@ export function createFinanceServer(
             ) {
               return;
             }
-            if (transaction.transactionDate === undefined) {
-              dateCoverageComplete = false;
+            const amount = new Decimal(transaction.amount);
+            if (amount.isZero()) return;
+            const canUseProviderDateRange =
+              transaction.status === "pending" || transaction.status === "held";
+            if (transaction.transactionDate === undefined && !canUseProviderDateRange) {
+              occurrenceCoverageComplete = false;
+              return;
             }
             const matchesRequestedDate =
-              transaction.transactionDate === undefined
-                ? transaction.status === "pending" || transaction.status === "held"
-                : transaction.transactionDate >= dateFrom &&
-                  transaction.transactionDate <= dateTo;
+              transaction.transactionDate === undefined ||
+              (transaction.transactionDate >= dateFrom && transaction.transactionDate <= dateTo);
             if (!matchesRequestedDate) return;
 
             totals.set(
               transaction.currency,
-              (totals.get(transaction.currency) ?? new Decimal(0)).plus(transaction.amount),
+              (totals.get(transaction.currency) ?? new Decimal(0)).plus(amount),
             );
             transactionsIncluded += 1;
             if (transactions.length < MAX_TRANSACTIONS_PER_RESULT) {
@@ -211,8 +211,7 @@ export function createFinanceServer(
           transactions,
           transactionsIncluded,
           transactionDetailsComplete: transactions.length === transactionsIncluded,
-          dateCoverageComplete,
-          complete: scan.complete,
+          complete: scan.complete && occurrenceCoverageComplete,
           pagesScanned: scan.pagesScanned,
         };
       }),
