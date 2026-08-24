@@ -62,15 +62,6 @@ const transactionFiltersSchema = dateRangeSchema.extend({
     .describe("Optional normalized transaction status filter"),
 });
 
-const spendingDateRangeSchema = dateRangeSchema.safeExtend({
-  dateFrom: isoDateSchema.describe(
-    "Inclusive first transaction date in YYYY-MM-DD format",
-  ),
-  dateTo: isoDateSchema.describe(
-    "Inclusive last transaction date in YYYY-MM-DD format",
-  ),
-});
-
 interface PageCursor {
   v: 1;
   accountId: string;
@@ -144,8 +135,8 @@ export function createFinanceServer(
     {
       title: "Get spending",
       description:
-        "Return debit spending by transaction date for a date range, across all accounts by default. Includes pending transactions and returns exact totals with the matching transaction records.",
-      inputSchema: spendingDateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
+        "Return debit spending for a date range across all accounts by default. Uses the bank-reported transaction date when available and includes pending transactions.",
+      inputSchema: dateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
       outputSchema: z.object({
         totalsByCurrency: z.record(
           currencySchema,
@@ -179,60 +170,39 @@ export function createFinanceServer(
         const totals = new Map<string, Decimal>();
         const transactions: Transaction[] = [];
         let transactionsIncluded = 0;
-        let transactionsScanned = 0;
-        let pagesScanned = 0;
         let dateCoverageComplete = true;
-        let complete = true;
 
-        outer: for (const accountId of accountIds) {
-          if (pagesScanned >= MAX_SUMMARY_PAGES) {
-            complete = false;
-            break;
-          }
-          let continuationKey: string | undefined;
-          do {
-            const page = await provider.listTransactions(accountId, {
-              dateFrom,
-              dateTo,
-              ...(continuationKey === undefined ? {} : { continuationKey }),
-            });
-            pagesScanned += 1;
-            for (const transaction of page.transactions) {
-              transactionsScanned += 1;
-              if (
-                transaction.direction === "debit" &&
-                SPENDING_STATUSES.has(transaction.status)
-              ) {
-                if (transaction.transactionDate === undefined) {
-                  dateCoverageComplete = false;
-                } else if (
-                  transaction.transactionDate >= dateFrom &&
-                  transaction.transactionDate <= dateTo
-                ) {
-                  totals.set(
-                    transaction.currency,
-                    (totals.get(transaction.currency) ?? new Decimal(0)).plus(
-                      transaction.amount,
-                    ),
-                  );
-                  transactionsIncluded += 1;
-                  if (transactions.length < MAX_TRANSACTIONS_PER_RESULT) {
-                    transactions.push(transaction);
-                  }
-                }
-              }
-              if (transactionsScanned >= MAX_SUMMARY_TRANSACTIONS) {
-                complete = false;
-                break outer;
-              }
+        const scan = await scanSummaryTransactions(
+          provider,
+          accountIds,
+          { dateFrom, dateTo },
+          (transaction) => {
+            if (
+              transaction.direction !== "debit" ||
+              !SPENDING_STATUSES.has(transaction.status)
+            ) {
+              return;
             }
-            continuationKey = page.continuationKey;
-            if (pagesScanned >= MAX_SUMMARY_PAGES && continuationKey !== undefined) {
-              complete = false;
-              break outer;
+            if (transaction.transactionDate === undefined) {
+              dateCoverageComplete = false;
             }
-          } while (continuationKey !== undefined);
-        }
+            const matchesRequestedDate =
+              transaction.transactionDate === undefined
+                ? transaction.status === "pending" || transaction.status === "held"
+                : transaction.transactionDate >= dateFrom &&
+                  transaction.transactionDate <= dateTo;
+            if (!matchesRequestedDate) return;
+
+            totals.set(
+              transaction.currency,
+              (totals.get(transaction.currency) ?? new Decimal(0)).plus(transaction.amount),
+            );
+            transactionsIncluded += 1;
+            if (transactions.length < MAX_TRANSACTIONS_PER_RESULT) {
+              transactions.push(transaction);
+            }
+          },
+        );
 
         return {
           totalsByCurrency: Object.fromEntries(
@@ -242,8 +212,8 @@ export function createFinanceServer(
           transactionsIncluded,
           transactionDetailsComplete: transactions.length === transactionsIncluded,
           dateCoverageComplete,
-          complete,
-          pagesScanned,
+          complete: scan.complete,
+          pagesScanned: scan.pagesScanned,
         };
       }),
   );
@@ -423,43 +393,20 @@ export function createFinanceServer(
         const accountIds = accountId === undefined ? await provider.listAccountIds() : [accountId];
         const totals = new Map<string, { credit: Decimal; debit: Decimal }>();
         let transactionsIncluded = 0;
-        let pagesScanned = 0;
-        let complete = true;
-
-        outer: for (const accountId of accountIds) {
-          if (pagesScanned >= MAX_SUMMARY_PAGES) {
-            complete = false;
-            break;
-          }
-          let continuationKey: string | undefined;
-          do {
-            const page = await provider.listTransactions(accountId, {
-              dateFrom,
-              dateTo,
-              status: "booked",
-              ...(continuationKey === undefined ? {} : { continuationKey }),
-            });
-            pagesScanned += 1;
-            for (const transaction of page.transactions) {
-              const current = totals.get(transaction.currency) ?? {
-                credit: new Decimal(0),
-                debit: new Decimal(0),
-              };
-              current[transaction.direction] = current[transaction.direction].plus(transaction.amount);
-              totals.set(transaction.currency, current);
-              transactionsIncluded += 1;
-              if (transactionsIncluded >= MAX_SUMMARY_TRANSACTIONS) {
-                complete = false;
-                break outer;
-              }
-            }
-            continuationKey = page.continuationKey;
-            if (pagesScanned >= MAX_SUMMARY_PAGES && continuationKey !== undefined) {
-              complete = false;
-              break outer;
-            }
-          } while (continuationKey !== undefined);
-        }
+        const scan = await scanSummaryTransactions(
+          provider,
+          accountIds,
+          { dateFrom, dateTo, status: "booked" },
+          (transaction) => {
+            const current = totals.get(transaction.currency) ?? {
+              credit: new Decimal(0),
+              debit: new Decimal(0),
+            };
+            current[transaction.direction] = current[transaction.direction].plus(transaction.amount);
+            totals.set(transaction.currency, current);
+            transactionsIncluded += 1;
+          },
+        );
 
         const totalsByCurrency = Object.fromEntries(
           [...totals.entries()].map(([currency, value]) => [
@@ -471,11 +418,59 @@ export function createFinanceServer(
             },
           ]),
         );
-        return { totalsByCurrency, transactionsIncluded, complete, pagesScanned };
+        return {
+          totalsByCurrency,
+          transactionsIncluded,
+          complete: scan.complete,
+          pagesScanned: scan.pagesScanned,
+        };
       }),
   );
 
   return server;
+}
+
+async function scanSummaryTransactions(
+  provider: EnableBankingClient,
+  accountIds: string[],
+  filters: { dateFrom: string; dateTo: string; status?: TransactionStatus },
+  visit: (transaction: Transaction) => void,
+): Promise<{ complete: boolean; pagesScanned: number }> {
+  let transactionsScanned = 0;
+  let pagesScanned = 0;
+  let complete = true;
+
+  outer: for (const accountId of accountIds) {
+    if (pagesScanned >= MAX_SUMMARY_PAGES) {
+      complete = false;
+      break;
+    }
+    let continuationKey: string | undefined;
+    do {
+      const page = await provider.listTransactions(accountId, {
+        dateFrom: filters.dateFrom,
+        dateTo: filters.dateTo,
+        ...(filters.status === undefined ? {} : { status: filters.status }),
+        ...(continuationKey === undefined ? {} : { continuationKey }),
+      });
+      pagesScanned += 1;
+      for (const transaction of page.transactions) {
+        transactionsScanned += 1;
+        visit(transaction);
+        if (transactionsScanned >= MAX_SUMMARY_TRANSACTIONS) {
+          complete = false;
+          break outer;
+        }
+      }
+      continuationKey = page.continuationKey;
+      if (pagesScanned >= MAX_SUMMARY_PAGES && continuationKey !== undefined) {
+        complete = false;
+        break outer;
+      }
+    } while (continuationKey !== undefined);
+  }
+
+  return { complete, pagesScanned };
 }
 
 async function safeResult<T extends Record<string, unknown>>(

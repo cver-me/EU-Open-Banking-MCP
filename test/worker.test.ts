@@ -183,8 +183,8 @@ describe("Worker boundary", () => {
     );
 
     const spendingTool = payload.result.tools.find(({ name }) => name === "finance_get_spending");
-    expect(spendingTool?.description).toContain("debit spending by transaction date");
-    expect(spendingTool?.description).toContain("Includes pending transactions");
+    expect(spendingTool?.description).toContain("debit spending for a date range");
+    expect(spendingTool?.description).toContain("includes pending transactions");
 
     expect(transactionTool?.description).toContain("for one account");
     expect(transactionTool?.description).toContain("filtered by lifecycle status");
@@ -197,7 +197,7 @@ describe("Worker boundary", () => {
     );
   });
 
-  it("answers spending by transaction date across accounts and includes pending activity", async () => {
+  it("answers spending by occurrence date and includes bank-ranged pending activity", async () => {
     await env.SESSION_STORE.put(
       SESSION_STORE_KEY,
       JSON.stringify([INTESA_SESSION_ID, REVOLUT_SESSION_ID]),
@@ -245,7 +245,7 @@ describe("Worker boundary", () => {
               transaction_amount: { amount: "-3.70", currency: "EUR" },
               credit_debit_indicator: "DBIT",
               status: "PDNG",
-              transaction_date: "2026-08-24",
+              booking_date: "2026-08-24",
               creditor: { name: "Bar Prima Porta" },
             },
           ],
@@ -292,18 +292,93 @@ describe("Worker boundary", () => {
           currency: "EUR",
           direction: "debit",
           status: "pending",
-          transactionDate: "2026-08-24",
+          bookingDate: "2026-08-24",
           counterparty: "Bar Prima Porta",
         },
       ],
       transactionsIncluded: 1,
       transactionDetailsComplete: true,
-      dateCoverageComplete: true,
+      dateCoverageComplete: false,
       complete: true,
       pagesScanned: 2,
     });
     expect(JSON.stringify(payload)).not.toContain("Licari Group");
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("summarizes booked cash flow across provider pages", async () => {
+    await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/sessions/${INTESA_SESSION_ID}`) {
+        return Response.json({
+          status: "AUTHORIZED",
+          accounts: [INTESA_ACCOUNT_ID],
+          aspsp: { name: "Intesa Sanpaolo", country: "IT" },
+          psu_type: "personal",
+        });
+      }
+      expect(url.pathname).toBe(`/accounts/${INTESA_ACCOUNT_ID}/transactions`);
+      expect(url.searchParams.get("transaction_status")).toBe("BOOK");
+      if (url.searchParams.get("continuation_key") === null) {
+        return Response.json({
+          transactions: [
+            {
+              transaction_amount: { amount: "-2.00", currency: "EUR" },
+              credit_debit_indicator: "DBIT",
+              status: "BOOK",
+            },
+          ],
+          continuation_key: "next-page",
+        });
+      }
+      expect(url.searchParams.get("continuation_key")).toBe("next-page");
+      return Response.json({
+        transactions: [
+          {
+            transaction_amount: { amount: "5.00", currency: "EUR" },
+            credit_debit_indicator: "CRDT",
+            status: "BOOK",
+          },
+        ],
+        continuation_key: null,
+      });
+    });
+
+    const response = await fetchAuthenticated(
+      new Request("https://localhost/mcp", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+          Host: "localhost",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "tools/call",
+          params: {
+            name: "finance_summarize_cash_flow",
+            arguments: { dateFrom: "2026-08-01", dateTo: "2026-08-24" },
+          },
+        }),
+      }),
+      {
+        ...env,
+        ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
+      },
+    );
+
+    const payload = parseSsePayload(await response.text()) as {
+      result: { structuredContent: Record<string, unknown> };
+    };
+    expect(payload.result.structuredContent).toEqual({
+      totalsByCurrency: { EUR: { credit: "5", debit: "2", net: "3" } },
+      transactionsIncluded: 2,
+      complete: true,
+      pagesScanned: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("rejects a future transaction start date before contacting Enable Banking", async () => {

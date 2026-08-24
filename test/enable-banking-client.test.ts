@@ -289,15 +289,46 @@ describe("EnableBankingClient", () => {
     expect(balanceHeaders.get("Psu-Accept")).toBeNull();
   });
 
-  it("rejects provider redirects instead of forwarding signed request headers", async () => {
-    const fetchMock = mockProvider(async () => Response.json({ balances: [] }));
+  it("uses manual redirect handling and rejects redirects without forwarding signed headers", async () => {
+    const fetchMock = mockProvider(async () =>
+      new Response(null, {
+        status: 302,
+        headers: { Location: "https://untrusted.example/collect" },
+      }),
+    );
 
-    await new EnableBankingClient(config, sessions).getBalances(ACCOUNT_ID);
+    await expect(
+      new EnableBankingClient(config, sessions).getBalances(ACCOUNT_ID),
+    ).rejects.toThrow("unexpected redirect");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     for (const [, init] of fetchMock.mock.calls) {
-      expect(init?.redirect).toBe("error");
+      expect(init?.redirect).toBe("manual");
     }
+  });
+
+  it("logs only metadata for runtime fetch errors", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sensitiveToken = "abcdefghijklmnopqrstuvwxyz0123456789";
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      new TypeError(
+        `Network failure for https://api.enablebanking.com/sessions/${SESSION_ID} ${sensitiveToken}`,
+      ),
+    );
+
+    await expect(
+      new EnableBankingClient(config, sessions).listTransactions(ACCOUNT_ID, {}),
+    ).rejects.toThrow(TypeError);
+
+    expect(errorSpy).toHaveBeenCalledOnce();
+    const log = String(errorSpy.mock.calls[0]?.[0]);
+    expect(log).not.toContain(SESSION_ID);
+    expect(log).not.toContain(sensitiveToken);
+    expect(JSON.parse(log)).toEqual({
+      message: "Enable Banking fetch threw",
+      operation: "session",
+      errorType: "TypeError",
+    });
   });
 
   it("returns partial all-account balances and continues after one bank error", async () => {

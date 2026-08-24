@@ -437,14 +437,35 @@ export class EnableBankingClient {
         method: init.method ?? "GET",
         headers,
         ...(init.body === undefined ? {} : { body: init.body }),
-        redirect: "error",
+        redirect: "manual",
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
       if (error instanceof DOMException && error.name === "TimeoutError") {
         throw providerTimeout();
       }
+      console.error(
+        JSON.stringify({
+          message: "Enable Banking fetch threw",
+          operation: providerOperation(path),
+          errorType: error instanceof Error ? error.name : typeof error,
+        }),
+      );
       throw error;
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      console.warn(
+        JSON.stringify({
+          message: "Enable Banking redirect rejected",
+          operation: providerOperation(path),
+          status: response.status,
+        }),
+      );
+      throw new PublicError(
+        "Enable Banking returned an unexpected redirect.",
+        "provider_redirect_rejected",
+      );
     }
 
     if (!response.ok) {
