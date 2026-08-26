@@ -8,6 +8,7 @@ const INTESA_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const REVOLUT_SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const INTESA_ACCOUNT_ID = "11111111-1111-4111-8111-111111111111";
 const REVOLUT_ACCOUNT_ID = "44444444-4444-4444-8444-444444444444";
+const MCP_PROTOCOL_VERSION = "2026-07-28";
 
 let providerPrivateKeyPem: string;
 
@@ -49,22 +50,58 @@ function callTool(
   workerEnv: Env = env,
 ): Promise<Response> {
   return fetchAuthenticated(
-    new Request("https://localhost/mcp", {
-      method: "POST",
-      headers: {
-        Accept: "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        Host: "localhost",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name, arguments: args },
-      }),
-    }),
+    createModernMcpRequest(id, "tools/call", { name, arguments: args }, name),
     workerEnv,
   );
+}
+
+function createModernMcpRequest(
+  id: number,
+  method: string,
+  params: Record<string, unknown>,
+  name?: string,
+): Request {
+  const headers = new Headers({
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Host: "localhost",
+    "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    "Mcp-Method": method,
+  });
+  if (name !== undefined) headers.set("Mcp-Name", name);
+
+  return new Request("https://localhost/mcp", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: {
+        ...params,
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+          "io.modelcontextprotocol/clientInfo": {
+            name: "personal-finance-eu-mcp-test",
+            version: "1.0.0",
+          },
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+}
+
+function createLegacyMcpRequest(id: number, method: string): Request {
+  return new Request("https://localhost/mcp", {
+    method: "POST",
+    headers: {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+      Host: "localhost",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params: {} }),
+  });
 }
 
 describe("Worker boundary", () => {
@@ -107,32 +144,17 @@ describe("Worker boundary", () => {
   });
 
   it("publishes only the six narrow, read-only finance tools", async () => {
-    const response = await fetchAuthenticated(
-      new Request("https://localhost/mcp", {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-          Host: "localhost",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/list",
-          params: {},
-        }),
-      }),
-    );
+    const response = await fetchAuthenticated(createModernMcpRequest(1, "tools/list", {}));
 
     expect(response.status).toBe(200);
-    const responseText = await response.text();
-    const dataLine = responseText
-      .split("\n")
-      .find((line) => line.startsWith("data: "))
-      ?.slice("data: ".length);
-    expect(dataLine).toBeDefined();
-    const payload = JSON.parse(dataLine ?? "null") as {
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    expect(response.headers.get("Mcp-Session-Id")).toBeNull();
+    const payload = (await response.json()) as {
       result: {
+        resultType: string;
+        ttlMs: number;
+        cacheScope: string;
+        _meta: Record<string, unknown>;
         tools: Array<{
           name: string;
           description?: string;
@@ -157,6 +179,17 @@ describe("Worker boundary", () => {
         }>;
       };
     };
+    expect(payload.result).toMatchObject({
+      resultType: "complete",
+      ttlMs: 0,
+      cacheScope: "private",
+      _meta: {
+        "io.modelcontextprotocol/serverInfo": {
+          name: "personal-finance-eu-mcp",
+          version: "0.1.0",
+        },
+      },
+    });
     expect(payload.result.tools.map((tool) => tool.name)).toEqual([
       "finance_list_accounts",
       "finance_get_balances",
@@ -225,6 +258,33 @@ describe("Worker boundary", () => {
     expect(cashFlowTool?.description).toContain(
       "booked credit, debit, and net accounting totals",
     );
+  });
+
+  it("keeps 2025-era requests as a compatibility fallback", async () => {
+    const response = await fetchAuthenticated(createLegacyMcpRequest(2, "tools/list"));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toContain("text/event-stream");
+    const payload = parseLegacySsePayload(await response.text()) as {
+      result: { tools: Array<{ name: string }> };
+    };
+    expect(payload.result.tools).toHaveLength(6);
+  });
+
+  it("enforces the required 2026 request headers", async () => {
+    const request = createModernMcpRequest(9, "tools/list", {});
+    request.headers.delete("Mcp-Method");
+
+    const response = await fetchAuthenticated(request);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: {
+        code: -32020,
+        data: { mismatch: { header: "(missing)" } },
+      },
+      id: 9,
+    });
   });
 
   it("answers spending by occurrence date and includes bank-ranged pending activity", async () => {
@@ -302,7 +362,7 @@ describe("Worker boundary", () => {
     );
 
     expect(response.status).toBe(200);
-    const payload = parseSsePayload(await response.text()) as {
+    const payload = (await response.json()) as {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
@@ -364,7 +424,7 @@ describe("Worker boundary", () => {
     );
 
     expect(response.status).toBe(200);
-    const payload = parseSsePayload(await response.text()) as {
+    const payload = (await response.json()) as {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
@@ -427,7 +487,7 @@ describe("Worker boundary", () => {
       },
     );
 
-    const payload = parseSsePayload(await response.text()) as {
+    const payload = (await response.json()) as {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
@@ -453,7 +513,7 @@ describe("Worker boundary", () => {
   });
 });
 
-function parseSsePayload(responseText: string): unknown {
+function parseLegacySsePayload(responseText: string): unknown {
   const dataLine = responseText
     .split("\n")
     .find((line) => line.startsWith("data: "))
