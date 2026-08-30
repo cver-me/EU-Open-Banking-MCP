@@ -131,6 +131,31 @@ export type CashAccountType = z.infer<typeof cashAccountTypeSchema>;
 export type Transaction = z.infer<typeof transactionSchema>;
 export type TransactionStatus = z.infer<typeof transactionStatusSchema>;
 
+export interface SpendingDateResolution {
+  effectiveDate?: string;
+  inferred: boolean;
+}
+
+export function resolveSpendingDate(
+  transaction: Pick<Transaction, "transactionDate" | "bookingDate" | "valueDate">,
+): SpendingDateResolution {
+  if (transaction.transactionDate !== undefined) {
+    return { effectiveDate: transaction.transactionDate, inferred: false };
+  }
+
+  const fallbackDates = [transaction.bookingDate, transaction.valueDate].filter(
+    (date): date is string => date !== undefined,
+  );
+  if (fallbackDates.length === 0) return { inferred: true };
+
+  return {
+    effectiveDate: fallbackDates.reduce((earliest, date) =>
+      date < earliest ? date : earliest,
+    ),
+    inferred: true,
+  };
+}
+
 export interface TransactionPage {
   transactions: Transaction[];
   continuationKey?: string;

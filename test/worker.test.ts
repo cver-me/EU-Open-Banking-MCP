@@ -33,7 +33,10 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => env.SESSION_STORE.delete(SESSION_STORE_KEY));
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 function fetchAuthenticated(request: Request, workerEnv: Env = env): Promise<Response> {
   return worker.fetch(
@@ -288,6 +291,8 @@ describe("Worker boundary", () => {
   });
 
   it("answers spending by occurrence date and includes bank-ranged pending activity", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-30T12:00:00.000Z"));
     await env.SESSION_STORE.put(
       SESSION_STORE_KEY,
       JSON.stringify([INTESA_SESSION_ID, REVOLUT_SESSION_ID]),
@@ -310,8 +315,8 @@ describe("Worker boundary", () => {
           psu_type: "personal",
         });
       }
-      expect(url.searchParams.get("date_from")).toBe("2026-08-24");
-      expect(url.searchParams.get("date_to")).toBe("2026-08-24");
+      expect(url.searchParams.get("date_from")).toBe("2026-08-17");
+      expect(url.searchParams.get("date_to")).toBe("2026-08-30");
       expect(url.searchParams.has("transaction_status")).toBe(false);
       if (url.pathname === `/accounts/${INTESA_ACCOUNT_ID}/transactions`) {
         return Response.json({
@@ -380,14 +385,16 @@ describe("Worker boundary", () => {
       ],
       transactionsIncluded: 1,
       transactionDetailsComplete: true,
-      complete: true,
+      complete: false,
       pagesScanned: 2,
     });
     expect(JSON.stringify(payload)).not.toContain("Licari Group");
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
-  it("marks spending incomplete when a booked debit has no occurrence date", async () => {
+  it("includes a booking-dated debit as inferred spending", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-30T12:00:00.000Z"));
     await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = new URL(String(input));
@@ -400,6 +407,8 @@ describe("Worker boundary", () => {
         });
       }
       expect(url.pathname).toBe(`/accounts/${INTESA_ACCOUNT_ID}/transactions`);
+      expect(url.searchParams.get("date_from")).toBe("2026-08-17");
+      expect(url.searchParams.get("date_to")).toBe("2026-08-30");
       return Response.json({
         transactions: [
           {
@@ -428,14 +437,93 @@ describe("Worker boundary", () => {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
-      totalsByCurrency: {},
-      transactions: [],
-      transactionsIncluded: 0,
+      totalsByCurrency: { EUR: "5" },
+      transactions: [
+        {
+          accountId: INTESA_ACCOUNT_ID,
+          amount: "5.00",
+          currency: "EUR",
+          direction: "debit",
+          status: "booked",
+          bookingDate: "2026-08-24",
+        },
+      ],
+      transactionsIncluded: 1,
       transactionDetailsComplete: true,
       complete: false,
       pagesScanned: 1,
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the earlier booking or value date when transaction date is absent", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-30T12:00:00.000Z"));
+    await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/sessions/${INTESA_SESSION_ID}`) {
+        return Response.json({
+          status: "AUTHORIZED",
+          accounts: [INTESA_ACCOUNT_ID],
+          aspsp: { name: "Intesa Sanpaolo", country: "IT" },
+          psu_type: "personal",
+        });
+      }
+      expect(url.pathname).toBe(`/accounts/${INTESA_ACCOUNT_ID}/transactions`);
+      return Response.json({
+        transactions: [
+          {
+            transaction_amount: { amount: "-5.00", currency: "EUR" },
+            credit_debit_indicator: "DBIT",
+            status: "BOOK",
+            booking_date: "2026-08-25",
+            value_date: "2026-08-24",
+          },
+          {
+            transaction_amount: { amount: "-7.00", currency: "EUR" },
+            credit_debit_indicator: "DBIT",
+            status: "BOOK",
+            booking_date: "2026-08-24",
+            value_date: "2026-08-25",
+          },
+          {
+            transaction_amount: { amount: "-11.00", currency: "EUR" },
+            credit_debit_indicator: "DBIT",
+            status: "BOOK",
+            booking_date: "2026-08-25",
+            value_date: "2026-08-26",
+          },
+        ],
+        continuation_key: null,
+      });
+    });
+
+    const response = await callTool(
+      5,
+      "finance_get_spending",
+      { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
+      {
+        ...env,
+        ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as {
+      result: { structuredContent: Record<string, unknown> };
+    };
+    expect(payload.result.structuredContent).toMatchObject({
+      totalsByCurrency: { EUR: "12" },
+      transactionsIncluded: 2,
+      transactionDetailsComplete: true,
+      complete: false,
+      pagesScanned: 1,
+    });
+    expect(payload.result.structuredContent.transactions).toEqual([
+      expect.objectContaining({ amount: "5.00", bookingDate: "2026-08-25", valueDate: "2026-08-24" }),
+      expect.objectContaining({ amount: "7.00", bookingDate: "2026-08-24", valueDate: "2026-08-25" }),
+    ]);
   });
 
   it("summarizes booked cash flow across provider pages", async () => {

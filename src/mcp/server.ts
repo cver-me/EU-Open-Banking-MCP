@@ -12,6 +12,7 @@ import {
   exactDecimalAmountSchema,
   isoDateSchema,
   nonNegativeDecimalAmountSchema,
+  resolveSpendingDate,
   transactionSchema,
   transactionStatusSchema,
   type Transaction,
@@ -26,6 +27,7 @@ const MAX_TRANSACTIONS_PER_RESULT = 200;
 const MAX_SEARCH_PAGES = 5;
 const MAX_SUMMARY_PAGES = 20;
 const MAX_SUMMARY_TRANSACTIONS = 10_000;
+const SPENDING_DATE_PADDING_DAYS = 7;
 const SPENDING_STATUSES = new Set<TransactionStatus>(["booked", "held", "other", "pending"]);
 
 const annotations = {
@@ -135,7 +137,7 @@ export function createFinanceServer(
     {
       title: "Get spending",
       description:
-        "Return debit spending for a date range across all accounts by default. Uses the bank-reported transaction date when available and includes pending transactions.",
+        "Return debit spending for a date range across all accounts by default. Uses the bank-reported transaction date when available; otherwise uses the earlier booking or value date as an inferred fallback, and includes pending transactions.",
       inputSchema: dateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
       outputSchema: z.object({
         totalsByCurrency: z.record(
@@ -156,7 +158,9 @@ export function createFinanceServer(
           .describe("True when every transaction included in the totals is returned in transactions"),
         complete: z
           .boolean()
-          .describe("True when spending for the requested range was fully determined"),
+          .describe(
+            "True when spending for the requested range was fully determined without inferred transaction dates",
+          ),
         pagesScanned: z.number().int().describe("Total provider pages scanned"),
       }),
       annotations,
@@ -168,11 +172,16 @@ export function createFinanceServer(
         const transactions: Transaction[] = [];
         let transactionsIncluded = 0;
         let occurrenceCoverageComplete = true;
+        const providerDateFrom = addDays(dateFrom, -SPENDING_DATE_PADDING_DAYS);
+        const providerDateTo = earlierDate(
+          addDays(dateTo, SPENDING_DATE_PADDING_DAYS),
+          todayIsoDate(),
+        );
 
         const scan = await scanSummaryTransactions(
           provider,
           accountIds,
-          { dateFrom, dateTo },
+          { dateFrom: providerDateFrom, dateTo: providerDateTo },
           (transaction) => {
             if (
               transaction.direction !== "debit" ||
@@ -182,16 +191,12 @@ export function createFinanceServer(
             }
             const amount = new Decimal(transaction.amount);
             if (amount.isZero()) return;
-            const canUseProviderDateRange =
-              transaction.status === "pending" || transaction.status === "held";
-            if (transaction.transactionDate === undefined && !canUseProviderDateRange) {
-              occurrenceCoverageComplete = false;
-              return;
-            }
+            const dateResolution = resolveSpendingDate(transaction);
             const matchesRequestedDate =
-              transaction.transactionDate === undefined ||
-              (transaction.transactionDate >= dateFrom && transaction.transactionDate <= dateTo);
+              dateResolution.effectiveDate === undefined ||
+              (dateResolution.effectiveDate >= dateFrom && dateResolution.effectiveDate <= dateTo);
             if (!matchesRequestedDate) return;
+            if (dateResolution.inferred) occurrenceCoverageComplete = false;
 
             totals.set(
               transaction.currency,
@@ -538,4 +543,17 @@ function base64UrlDecode(value: string): string {
 
 function differenceInDays(from: string, to: string): number {
   return (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000;
+}
+
+function addDays(date: string, days: number): string {
+  const timestamp = Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000;
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function earlierDate(first: string, second: string): string {
+  return first < second ? first : second;
+}
+
+function todayIsoDate(): string {
+  return new Date().toISOString().slice(0, 10);
 }
