@@ -28,15 +28,15 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
-    "agents": "0.21.0",
+    "agents": "0.22.0",
     "decimal.js": "10.6.0",
     "jose": "6.2.10",
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.0.0",
+    "@cloudflare/vitest-plugin": "1.1.2",
     "typescript": "7.0.2",
     "vitest": "4.1.11",
-    "wrangler": "4.125.0"
+    "wrangler": "4.127.1"
   }
 }
