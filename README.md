@@ -34,12 +34,12 @@ flowchart LR
   C[ChatGPT, Codex, or another MCP client] --> A[Cloudflare Access]
   A -->|platform-validated ctx.access| W[Stateless MCP Worker]
   W -->|session IDs only| K[Workers KV]
-  W -->|fresh RS256 JWT per call| E[Enable Banking]
+  W -->|request-scoped RS256 JWT| E[Enable Banking]
   E --> B[Your bank]
 ```
 
 - Client → MCP: Cloudflare Access Managed OAuth, restricted to the deployment owner.
-- MCP → Enable Banking: a one-hour RS256 JWT signed from a private key stored as a Worker secret.
+- MCP → Enable Banking: a one-hour RS256 JWT signed from a private key stored as a Worker secret. Signing is shared across provider calls within one incoming request; tokens are not shared between requests.
 - Storage: KV contains only Enable Banking session IDs created through the protected setup flow.
 - Online account reads: the Worker forwards Cloudflare's connecting-client IP and the MCP client's
   User-Agent as Enable Banking's `Psu-Ip-Address` and `Psu-User-Agent` headers. These request-scoped

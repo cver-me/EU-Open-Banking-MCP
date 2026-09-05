@@ -35,6 +35,23 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("EnableBankingClient", () => {
+  it("signs once across concurrent provider calls, refreshes before expiry, and isolates clients", async () => {
+    const signSpy = vi.spyOn(crypto.subtle, "sign");
+    mockProvider(async () => Response.json({ balances: [] }));
+    const now = Date.now();
+    const timeSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const client = new EnableBankingClient(config, sessions);
+    await Promise.all([client.getBalances(ACCOUNT_ID), client.getBalances(ACCOUNT_ID)]);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    await client.getBalances(ACCOUNT_ID);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    timeSpy.mockReturnValue(now + 3_540_000);
+    await client.getBalances(ACCOUNT_ID);
+    expect(signSpy).toHaveBeenCalledTimes(2);
+    await new EnableBankingClient(config, sessions).getBalances(ACCOUNT_ID);
+    expect(signSpy).toHaveBeenCalledTimes(3);
+  });
+
   it("discovers the account through its session and builds the documented JWT", async () => {
     const fetchMock = mockProvider(async (url) => {
       expect(url.pathname).toBe(`/accounts/${ACCOUNT_ID}/transactions`);

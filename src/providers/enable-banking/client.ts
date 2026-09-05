@@ -115,6 +115,7 @@ const TRANSACTION_STATUS_CODES = Object.fromEntries(
 
 export class EnableBankingClient {
   private keyPromise: Promise<CryptoKey> | undefined;
+  private token: { promise: Promise<string>; refreshAt: number } | undefined;
   private accountsPromise: Promise<AuthorizedAccount[]> | undefined;
 
   constructor(
@@ -406,6 +407,20 @@ export class EnableBankingClient {
 
   private async authorizationToken(): Promise<string> {
     const now = Math.floor(Date.now() / 1_000);
+    if (this.token !== undefined && now < this.token.refreshAt) return this.token.promise;
+    // The client belongs to one request. Share signing work across its provider calls,
+    // including concurrent session discovery, without caching any financial data.
+    const promise = this.signAuthorizationToken(now);
+    this.token = { promise, refreshAt: now + 3_540 };
+    try {
+      return await promise;
+    } catch (error) {
+      if (this.token?.promise === promise) this.token = undefined;
+      throw error;
+    }
+  }
+
+  private async signAuthorizationToken(now: number): Promise<string> {
     this.keyPromise ??= importPKCS8(this.config.enableBanking.privateKeyPem, "RS256");
     return new SignJWT({})
       .setProtectedHeader({
