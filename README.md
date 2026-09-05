@@ -54,18 +54,24 @@ The Worker does not store balances, transactions, account UUIDs, IBANs, authoriz
 | --- | --- | --- |
 | `finance_list_accounts` | Discover active accounts and bank-provided metadata | 20 authorized sessions, 20 active accounts |
 | `finance_get_balances` | One discovered account or all active accounts | Partial per-account results; sequential within each bank |
-| `finance_get_spending` | Purchases and payments by occurrence date, including pending activity | 366 days, 20 pages, 10,000 scanned transactions, 200 returned details |
+| `finance_get_spending` | Gross debit estimate with date provenance and separate booked/pending/held totals | 366 days, 20 pages, 10,000 matching transactions, 200 returned details |
 | `finance_list_transactions` | Paginated normalized transactions | 366 days, 200 results per response |
 | `finance_search_transactions` | Text search over transaction metadata | 366 days, 5 provider pages, 100 matches |
 | `finance_summarize_cash_flow` | Booked credit/debit/net totals by currency | 366 days, 20 pages, 10,000 transactions |
 
-`finance_list_accounts` returns an opaque, session-specific `accountId`. Tools that target one account accept that ID and verify it against the active Enable Banking sessions before use. No aliases or manually copied account UUIDs are required.
+`finance_list_accounts` returns an opaque, session-specific `accountId`. Tools that target one account accept that ID and verify it against the active Enable Banking sessions before use. No aliases or manually copied account UUIDs are required. All-account reads deduplicate sessions referring to the same primary account identity hash, when supplied by Enable Banking. These hashes stay in request memory and are never exposed or persisted; names and secondary fuzzy hashes are never used to guess account identity.
 
 Pagination `nextCursor` values contain encoded continuation state; they are opaque but not confidential. Return them unchanged with the same account and filters. The Worker validates their embedded context before use.
 
-Every tool is read-only, non-destructive, and idempotent. Provider codes are normalized into descriptive values such as `interim_available`, `booked`, and `professional`. Multiple balances for one account are alternative measurements and must never be added together. Monetary calculations use decimal arithmetic and never combine currencies.
+Every tool is read-only, non-destructive, and idempotent. Provider codes are normalized into descriptive values such as `interim_available`, `booked`, and `professional`. Multiple balances for one account are alternative measurements and must never be added together. Balance labels and bank timestamps are preserved; a fresh fetch does not establish a fresh measurement. Monetary calculations never combine currencies. Provider amount strings are bounded to 100 characters, and aggregation precision accommodates mixed decimal scales and the 10,000-entry limit without rounding.
 
-For everyday questions about what or how much the user spent, paid, or bought on a date, `finance_get_spending` scans all active accounts unless one is selected. It uses the bank-reported transaction date when supplied. For pending or held activity without that optional field, it trusts the bank's placement in the requested date range rather than treating a booked entry's later accounting date as the payment date. Its `complete` field is false when scan limits or missing occurrence metadata prevent a full result. `finance_summarize_cash_flow` remains intentionally limited to booked accounting entries.
+For everyday spending questions, `finance_get_spending` scans all active accounts unless one is selected. Its default response contains totals and completeness information; set `includeTransactions: true` for up to 200 supporting entries with `effectiveDate` and `dateSource`. It uses the bank-reported transaction date when supplied, otherwise the earlier booking or value date as an inferred fallback. The response separates gross debit totals into `booked`, `pending`, and `held` in `totalsByStatus`. Undated debits and unknown statuses are excluded from totals. `incompleteReasons` explains scan limits, repeated cursors, inferred dates, and exclusions. The provider query uses seven-day padding to catch nearby postings; neither padding nor `complete: true` guarantees that a bank supplied every historical payment.
+
+These totals are account activity, not classified household expenses: internal transfers, cash withdrawals, and card repayments may be included, and refunds are not netted. `finance_summarize_cash_flow` includes only booked records, enforcing the status filter locally as well as at the provider. Its credits are not necessarily income and its debits are not necessarily expenses. List and search tools use the provider's date-range semantics; those filters are not guaranteed to select purchase dates.
+
+See [the API-to-MCP mapping](docs/api-to-mcp.md) for the preserved fields, derived values, and interpretation limits.
+
+Date ranges include both endpoints and cover at most 366 calendar days. Search and summary scans stop on repeated provider continuation keys and mark the result incomplete instead of repeatedly fetching the same page.
 
 For a complete balance refresh, call `finance_get_balances` once without an `accountId`. It discovers
 all active sessions itself, so a preceding `finance_list_accounts` call is unnecessary. The response
@@ -152,7 +158,7 @@ Before connecting a model, confirm:
 
 - unauthenticated requests are rejected by Access;
 - `/setup` lists only sessions created by this deployment;
-- MCP `tools/list` exposes exactly the five tools above;
+- MCP `tools/list` exposes exactly the six tools above;
 - `finance_list_accounts` returns opaque account IDs but no IBANs;
 - a small balance and transaction request succeeds;
 - one all-account balance request returns successful accounts even when another account fails;
