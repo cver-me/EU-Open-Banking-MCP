@@ -238,7 +238,7 @@ describe("Worker boundary", () => {
     expect(transactionTool?.inputSchema?.properties?.dateTo?.format).toBe("date");
     const transactionProperties = transactionTool?.outputSchema?.properties?.transactions?.items?.properties;
     expect(transactionProperties?.transactionDate?.description).toContain(
-      "when the payment or transaction occurred",
+      "purchase date for cards",
     );
     expect(transactionProperties?.bookingDate?.description).toContain(
       "not the date the user made the payment",

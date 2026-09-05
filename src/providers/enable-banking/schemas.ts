@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_PROVIDER_AMOUNT_LENGTH } from "../../money";
 import {
   countryCodeSchema,
   currencySchema,
@@ -95,7 +96,7 @@ export type EnableBankingTransactionStatus = (typeof ENABLE_BANKING_TRANSACTION_
 
 const amountSchema = z.object({
   currency: currencySchema,
-  amount: exactDecimalAmountSchema,
+  amount: exactDecimalAmountSchema.max(MAX_PROVIDER_AMOUNT_LENGTH),
 });
 
 export const aspspSchema = z.object({
@@ -134,6 +135,10 @@ export const sessionSchema = z.object({
     "REVOKED",
   ]),
   accounts: z.array(z.uuid()).max(MAX_ENABLE_BANKING_ACCOUNTS),
+  accounts_data: optionalProviderField(z.array(z.object({
+    uid: z.uuid(),
+    identification_hash: optionalProviderField(z.string().min(1).max(4_096)),
+  })).max(MAX_ENABLE_BANKING_ACCOUNTS)),
   aspsp: aspspSchema,
   psu_type: z.enum(["business", "personal"]),
 });
@@ -142,6 +147,7 @@ export const accountDetailsSchema = z.object({
   name: z.string().nullable().optional(),
   currency: currencySchema,
   product: z.string().nullable().optional(),
+  details: optionalProviderField(z.string()),
   usage: z.enum(ENABLE_BANKING_ACCOUNT_USAGES).nullable().optional(),
   cash_account_type: z.enum(ENABLE_BANKING_CASH_ACCOUNT_TYPES),
 });
@@ -150,12 +156,13 @@ const balanceSchema = z.object({
   name: z.string(),
   balance_amount: amountSchema,
   balance_type: z.enum(ENABLE_BANKING_BALANCE_TYPES),
-  reference_date: isoDateSchema.optional(),
+  reference_date: optionalProviderField(isoDateSchema),
+  last_change_date_time: optionalProviderField(z.iso.datetime({ offset: true })),
 });
 
 export const balancesSchema = z.object({ balances: z.array(balanceSchema) });
 
-// ASPSPs encode absent optional transaction values as either omitted or null.
+// ASPSPs encode absent optional values as either omitted or null.
 function optionalProviderField<T extends z.ZodType>(schema: T) {
   return z.preprocess(
     (value) => (value === null ? undefined : value),
@@ -180,6 +187,10 @@ const transactionSchema = z.object({
   remittance_information: optionalProviderField(z.array(z.string())),
   note: optionalProviderField(z.string()),
   entry_reference: optionalProviderField(z.string()),
+  reference_number: optionalProviderField(z.string()),
+  bank_transaction_code: optionalProviderField(z.object({
+    description: optionalProviderField(z.string()),
+  })),
 });
 
 export const transactionsSchema = z.object({

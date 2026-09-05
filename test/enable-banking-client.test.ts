@@ -35,6 +35,104 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("EnableBankingClient", () => {
+  it.each(["same", "different", "absent"])(
+    "matches accounts across sessions only using primary identity hashes (%s)",
+    async (identity) => {
+      sessions.list = vi.fn(async () => [SESSION_ID, SECOND_SESSION_ID]);
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+        const path = new URL(String(input)).pathname;
+        if (path.startsWith("/sessions/")) {
+          const second = path.endsWith(SECOND_SESSION_ID);
+          const accountId = second ? SECOND_ACCOUNT_ID : ACCOUNT_ID;
+          return Response.json({
+            status: "AUTHORIZED",
+            accounts: [accountId],
+            accounts_data: [{
+              uid: accountId,
+              ...(identity === "absent" ? {} : {
+                identification_hash: second && identity === "different" ? "second-primary" : "first-primary",
+              }),
+              identification_hashes: ["shared-secondary-fuzzy-hash"],
+            }],
+            aspsp: { name: "Example Bank", country: "DE" },
+            psu_type: "personal",
+          });
+        }
+        if (path.endsWith("/details")) {
+          return Response.json({ name: "Same Holder", currency: "EUR", cash_account_type: "CACC" });
+        }
+        return Response.json({ balances: [] });
+      });
+      const client = new EnableBankingClient(config, sessions);
+      const accountIds = await client.listAccountIds();
+      expect(accountIds).toEqual(identity === "same" ? [ACCOUNT_ID] : [ACCOUNT_ID, SECOND_ACCOUNT_ID]);
+      const summaries = await client.listAccounts();
+      expect(summaries).toHaveLength(accountIds.length);
+      expect(JSON.stringify(summaries)).not.toContain("primary");
+      expect(JSON.stringify(summaries)).not.toContain("hash");
+      fetchMock.mockClear();
+      await client.getBalances();
+      expect(fetchMock).toHaveBeenCalledTimes(accountIds.length);
+      // An explicitly selected alias is still authorized, even if all-account reads deduplicate it.
+      await expect(client.getBalances(SECOND_ACCOUNT_ID)).resolves.toEqual({ balances: [], errors: [] });
+    },
+  );
+
+  it("preserves account descriptions and omits blank optional names", async () => {
+    mockProvider(async () => Response.json({
+      name: "  ", product: null, details: " Household account ", currency: "EUR", cash_account_type: "CACC",
+    }));
+    const [account] = await new EnableBankingClient(config, sessions).listAccounts();
+    expect(account).toMatchObject({ description: "Household account" });
+    expect(account).not.toHaveProperty("name");
+    expect(account).not.toHaveProperty("product");
+  });
+
+  it("preserves a balance label and bank timestamp independently of fetch time", async () => {
+    mockProvider(async () => Response.json({ balances: [{
+      name: "Credit used", balance_type: "OTHR",
+      balance_amount: { amount: "-12.34", currency: "EUR" },
+      reference_date: "2026-08-01", last_change_date_time: "2026-08-01T13:15:00+02:00",
+    }] }));
+    const result = await new EnableBankingClient(config, sessions).getBalances(ACCOUNT_ID);
+    expect(result.balances[0]).toMatchObject({
+      amount: "-12.34", balanceType: "other", label: "Credit used",
+      referenceDate: "2026-08-01", lastChangedAt: "2026-08-01T13:15:00+02:00",
+    });
+  });
+
+  it("preserves transaction classification and payment references without exposing party identifiers", async () => {
+    mockProvider(async () => Response.json({ transactions: [{
+      transaction_amount: { amount: "-10.50", currency: "EUR" },
+      credit_debit_indicator: "CRDT", status: "BOOK",
+      debtor: { name: "Sender", postal_address: { address_line: ["private-address"] } },
+      creditor: { name: "Account owner" },
+      debtor_account: { iban: "private-iban" },
+      entry_reference: "entry-1", reference_number: "invoice-2",
+      bank_transaction_code: { code: "PMNT", sub_code: "RCDT", description: "Transfer received" },
+      transaction_id: "unstable-detail-token",
+    }] }));
+    const page = await new EnableBankingClient(config, sessions).listTransactions(ACCOUNT_ID, {});
+    expect(page.transactions[0]).toEqual({
+      accountId: ACCOUNT_ID, amount: "10.50", currency: "EUR", direction: "credit", status: "booked",
+      counterparty: "Sender", reference: "entry-1", paymentReference: "invoice-2",
+      bankTransactionDescription: "Transfer received",
+    });
+    expect(JSON.stringify(page)).not.toMatch(/private-|unstable-detail/);
+  });
+
+  it("enforces requested status locally while retaining the continuation key", async () => {
+    mockProvider(async () => Response.json({
+      transactions: ["BOOK", "PDNG", "CNCL"].map((status) => ({
+        transaction_amount: { amount: "10", currency: "EUR" }, credit_debit_indicator: "DBIT", status,
+      })),
+      continuation_key: "next-status-page",
+    }));
+    const page = await new EnableBankingClient(config, sessions).listTransactions(ACCOUNT_ID, { status: "pending" });
+    expect(page.transactions.map(({ status }) => status)).toEqual(["pending"]);
+    expect(page.continuationKey).toBe("next-status-page");
+  });
+
   it("signs once across concurrent provider calls, refreshes before expiry, and isolates clients", async () => {
     const signSpy = vi.spyOn(crypto.subtle, "sign");
     mockProvider(async () => Response.json({ balances: [] }));
@@ -50,6 +148,42 @@ describe("EnableBankingClient", () => {
     expect(signSpy).toHaveBeenCalledTimes(2);
     await new EnableBankingClient(config, sessions).getBalances(ACCOUNT_ID);
     expect(signSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("treats a null optional balance reference date as absent", async () => {
+    mockProvider(async () => Response.json({ balances: [{
+      name: "Available balance",
+      balance_amount: { amount: "12.34", currency: "EUR" },
+      balance_type: "ITAV",
+      reference_date: null,
+    }] }));
+    const result = await new EnableBankingClient(config, sessions).getBalances(ACCOUNT_ID);
+    expect(result.errors).toEqual([]);
+    expect(result.balances).toEqual([expect.objectContaining({ amount: "12.34" })]);
+    expect(result.balances[0]).not.toHaveProperty("referenceDate");
+  });
+
+  it("reports invalid balance data with safe schema diagnostics", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockProvider(async () => Response.json({ balances: [{
+      name: "sensitive-bank-label",
+      balance_amount: { amount: "sensitive-invalid-amount", currency: "EUR" },
+      balance_type: "ITAV",
+    }] }));
+    const result = await new EnableBankingClient(config, sessions).getBalances();
+    expect(result.errors).toEqual([expect.objectContaining({
+      code: "provider_response_invalid",
+      message: "Enable Banking returned unsupported balance data.",
+    })]);
+    expect(errorSpy).toHaveBeenCalledOnce();
+    const log = String(errorSpy.mock.calls[0]?.[0]);
+    expect(log).not.toContain("sensitive");
+    expect(JSON.parse(log)).toEqual({
+      message: "Enable Banking response validation failed",
+      operation: "get_account_balances",
+      issueCount: 1,
+      issues: [{ code: "invalid_format", path: "balances.0.balance_amount.amount" }],
+    });
   });
 
   it("discovers the account through its session and builds the documented JWT", async () => {
@@ -276,6 +410,7 @@ describe("EnableBankingClient", () => {
       amount: "123.45",
       currency: "EUR",
       balanceType: "closing_available",
+      label: "Balance",
       referenceDate: "2026-08-23",
     });
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain(
@@ -403,6 +538,7 @@ describe("EnableBankingClient", () => {
         amount: "50.00",
         currency: "EUR",
         balanceType: "interim_available",
+        label: "Available balance",
         referenceDate: "2026-08-23",
       },
     ]);

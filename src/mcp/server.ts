@@ -117,7 +117,7 @@ export function createFinanceServer(
     {
       title: "Get account balances",
       description:
-        "Get current balance measurements for one discovered account ID, or all active accounts in one call. All-account reads may return partial results in errors; do not immediately retry rate-limited accounts. Multiple balances for one account are alternative measurements, not components: never add them together, and state the balance type when answering.",
+        "Get bank-reported balance measurements for one discovered account ID, or all active accounts in one call. Check referenceDate and lastChangedAt; fetching now does not mean the balance was measured today. All-account reads may return partial results in errors; do not immediately retry rate-limited accounts. Multiple balances for one account are alternative measurements, not components: never add them together, and state the balance type and label when answering.",
       inputSchema: z.object({ accountId: accountIdSchema.optional() }),
       outputSchema: z.object({
         balances: z.array(balanceSchema),

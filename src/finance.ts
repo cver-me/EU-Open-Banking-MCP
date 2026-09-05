@@ -66,6 +66,7 @@ export const accountSummarySchema = z.object({
   currency: currencySchema,
   name: z.string().optional().describe("Account holder name reported by the bank"),
   product: z.string().optional().describe("Bank's product name for the account"),
+  description: z.string().optional().describe("Account description supplied by the bank or account owner"),
   usage: accountUsageSchema
     .optional()
     .describe("Whether the account is personal or professional"),
@@ -79,7 +80,9 @@ export const balanceSchema = z.object({
   currency: currencySchema,
   amount: exactDecimalAmountSchema,
   balanceType: balanceTypeSchema.describe("Normalized meaning of this balance measurement"),
+  label: z.string().optional().describe("Bank-provided balance label; use it to interpret other or ambiguous balance types"),
   referenceDate: isoDateSchema.optional().describe("Date to which this balance applies"),
+  lastChangedAt: z.iso.datetime({ offset: true }).optional().describe("Bank-reported time this balance last changed; not the time it was fetched"),
 });
 
 export const accountReadErrorSchema = z.object({
@@ -103,7 +106,7 @@ export const transactionSchema = z.object({
   transactionDate: isoDateSchema
     .optional()
     .describe(
-      "Bank-reported date when the payment or transaction occurred; use this for questions about when the user spent or paid",
+      "Bank-reported transaction date: purchase date for cards, acquiring date for transfers, receiving date for direct debits",
     ),
   bookingDate: isoDateSchema
     .optional()
@@ -117,9 +120,12 @@ export const transactionSchema = z.object({
   description: z
     .string()
     .optional()
-    .describe("Combined remittance information and bank-provided transaction note"),
+    .describe("Combined remittance information and account owner's transaction note"),
   merchantCategoryCode: z.string().optional().describe("Merchant category code reported by the bank"),
-  reference: z.string().optional().describe("Bank-provided transaction entry reference"),
+  reference: z.string().optional().describe("Bank-provided immutable entry reference, unique within the account; not a payment reference"),
+  paymentReference: z.string().optional().describe("Structured creditor/payment reference supplied by the bank"),
+  bankTransactionDescription: z.string().optional()
+    .describe("Bank-provided description of the transaction type; not an inferred spending category"),
 });
 
 export type AccountSummary = z.infer<typeof accountSummarySchema>;

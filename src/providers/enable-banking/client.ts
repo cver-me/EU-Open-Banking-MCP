@@ -1,4 +1,5 @@
 import { importPKCS8, SignJWT } from "jose";
+import type { z } from "zod";
 import type { AppConfig } from "../../config";
 import { errorMessage, PublicError } from "../../errors";
 import type {
@@ -46,6 +47,7 @@ interface AuthorizedAccount {
   accountId: string;
   institution: string;
   country: string;
+  identificationHash?: string;
 }
 
 export interface BalanceReadResult {
@@ -125,7 +127,7 @@ export class EnableBankingClient {
   ) {}
 
   async listAccounts(): Promise<AccountSummary[]> {
-    const accounts = await this.authorizedAccounts();
+    const accounts = await this.selectAccounts();
     const groupedResults = await Promise.all(
       groupAccountsByInstitution(accounts).map(async (group) => {
         const summaries: AccountSummary[] = [];
@@ -137,14 +139,18 @@ export class EnableBankingClient {
               true,
             ),
           );
+          const name = optionalText(details.name);
+          const product = optionalText(details.product);
+          const description = optionalText(details.details);
           summaries.push({
             accountId,
             institution,
             country,
             currency: details.currency,
             cashAccountType: CASH_ACCOUNT_TYPES[details.cash_account_type],
-            ...(details.name == null ? {} : { name: details.name }),
-            ...(details.product == null ? {} : { product: details.product }),
+            ...(name === undefined ? {} : { name }),
+            ...(product === undefined ? {} : { product }),
+            ...(description === undefined ? {} : { description }),
             ...(details.usage == null ? {} : { usage: ACCOUNT_USAGES[details.usage] }),
           });
         }
@@ -193,22 +199,31 @@ export class EnableBankingClient {
   }
 
   private async getAccountBalances(account: AuthorizedAccount): Promise<Balance[]> {
-    const response = balancesSchema.parse(
+    const response = parseProviderResponse(
+      balancesSchema,
       await this.request(
         `/accounts/${encodeURIComponent(account.accountId)}/balances`,
         {},
         true,
       ),
+      "get_account_balances",
+      "balance",
     );
-    return response.balances.map((balance) => ({
-      accountId: account.accountId,
-      institution: account.institution,
-      country: account.country,
-      currency: balance.balance_amount.currency,
-      amount: balance.balance_amount.amount,
-      balanceType: BALANCE_TYPES[balance.balance_type],
-      ...(balance.reference_date === undefined ? {} : { referenceDate: balance.reference_date }),
-    }));
+    return response.balances.map((balance) => {
+      const label = optionalText(balance.name);
+      return {
+        accountId: account.accountId,
+        institution: account.institution,
+        country: account.country,
+        currency: balance.balance_amount.currency,
+        amount: balance.balance_amount.amount,
+        balanceType: BALANCE_TYPES[balance.balance_type],
+        ...(label === undefined ? {} : { label }),
+        ...(balance.reference_date === undefined ? {} : { referenceDate: balance.reference_date }),
+        ...(balance.last_change_date_time === undefined
+          ? {} : { lastChangedAt: balance.last_change_date_time }),
+      };
+    });
   }
 
   async listTransactions(accountId: string, query: TransactionQuery): Promise<TransactionPage> {
@@ -232,16 +247,16 @@ export class EnableBankingClient {
     );
 
     const page: TransactionPage = {
-      transactions: response.transactions.map((transaction) =>
-        normalizeTransaction(accountId, transaction),
-      ),
+      transactions: response.transactions
+        .map((transaction) => normalizeTransaction(accountId, transaction))
+        .filter((transaction) => query.status === undefined || transaction.status === query.status),
     };
     if (response.continuation_key) page.continuationKey = response.continuation_key;
     return page;
   }
 
   async listAccountIds(): Promise<string[]> {
-    return (await this.authorizedAccounts()).map(({ accountId }) => accountId);
+    return (await this.selectAccounts()).map(({ accountId }) => accountId);
   }
 
   async listConnections(): Promise<ConnectionSummary[]> {
@@ -351,7 +366,7 @@ export class EnableBankingClient {
 
   private async selectAccounts(accountId?: string): Promise<AuthorizedAccount[]> {
     const accounts = await this.authorizedAccounts();
-    if (accountId === undefined) return accounts;
+    if (accountId === undefined) return uniqueAccounts(accounts);
     const account = accounts.find((candidate) => candidate.accountId === accountId);
     if (account === undefined) throw unknownAccount();
     return [account];
@@ -388,10 +403,12 @@ export class EnableBankingClient {
     for (const session of sessions) {
       if (session === undefined || session.status !== "AUTHORIZED") continue;
       for (const accountId of session.accounts) {
+        const identificationHash = session.accounts_data?.find(({ uid }) => uid === accountId)?.identification_hash;
         accounts.set(accountId, {
           accountId,
           institution: session.aspsp.name,
           country: session.aspsp.country,
+          ...(identificationHash === undefined ? {} : { identificationHash }),
         });
         if (accounts.size > MAX_ENABLE_BANKING_ACCOUNTS) {
           throw new PublicError(
@@ -492,7 +509,16 @@ export class EnableBankingClient {
 }
 
 function parseTransactionsResponse(value: unknown) {
-  const parsed = transactionsSchema.safeParse(value);
+  return parseProviderResponse(transactionsSchema, value, "get_account_transactions", "transaction");
+}
+
+function parseProviderResponse<T extends z.ZodType>(
+  schema: T,
+  value: unknown,
+  operation: "get_account_balances" | "get_account_transactions",
+  dataKind: "balance" | "transaction",
+): z.output<T> {
+  const parsed = schema.safeParse(value);
   if (parsed.success) {
     return parsed.data;
   }
@@ -500,7 +526,7 @@ function parseTransactionsResponse(value: unknown) {
   console.error(
     JSON.stringify({
       message: "Enable Banking response validation failed",
-      operation: "get_account_transactions",
+      operation,
       issueCount: parsed.error.issues.length,
       issues: parsed.error.issues.slice(0, 10).map((issue) => ({
         code: issue.code,
@@ -510,7 +536,7 @@ function parseTransactionsResponse(value: unknown) {
   );
 
   throw new PublicError(
-    "Enable Banking returned unsupported transaction data.",
+    `Enable Banking returned unsupported ${dataKind} data.`,
     "provider_response_invalid",
   );
 }
@@ -607,6 +633,18 @@ function groupAccountsByInstitution(accounts: AuthorizedAccount[]): AuthorizedAc
   return [...groups.values()];
 }
 
+function uniqueAccounts(accounts: AuthorizedAccount[]): AuthorizedAccount[] {
+  const seen = new Set<string>();
+  return accounts.filter((account) => {
+    // Only the primary hash is documented for unique matching. Secondary hashes
+    // are fuzzy identifiers. Never guess identity from holder names or balances.
+    if (account.identificationHash === undefined) return true;
+    if (seen.has(account.identificationHash)) return false;
+    seen.add(account.identificationHash);
+    return true;
+  });
+}
+
 function accountReadError(account: AuthorizedAccount, error: unknown): AccountReadError {
   return {
     accountId: account.accountId,
@@ -637,7 +675,8 @@ function unknownAccount(): PublicError {
 
 function normalizeTransaction(accountId: string, transaction: EnableBankingTransaction): Transaction {
   const credit = transaction.credit_debit_indicator === "CRDT";
-  const counterparty = credit ? transaction.debtor?.name : transaction.creditor?.name;
+  const counterparty = optionalText(credit ? transaction.debtor?.name : transaction.creditor?.name);
+  const bankTransactionDescription = optionalText(transaction.bank_transaction_code?.description);
   const description = [transaction.remittance_information?.join(" "), transaction.note]
     .filter((value): value is string => value !== undefined && value.length > 0)
     .join(" — ");
@@ -659,5 +698,11 @@ function normalizeTransaction(accountId: string, transaction: EnableBankingTrans
       ? {}
       : { merchantCategoryCode: transaction.merchant_category_code }),
     ...(transaction.entry_reference === undefined ? {} : { reference: transaction.entry_reference }),
+    ...(transaction.reference_number === undefined ? {} : { paymentReference: transaction.reference_number }),
+    ...(bankTransactionDescription === undefined ? {} : { bankTransactionDescription }),
   };
+}
+
+function optionalText(value: string | null | undefined): string | undefined {
+  return value?.trim() || undefined;
 }
