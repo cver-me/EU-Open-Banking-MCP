@@ -137,29 +137,34 @@ export type CashAccountType = z.infer<typeof cashAccountTypeSchema>;
 export type Transaction = z.infer<typeof transactionSchema>;
 export type TransactionStatus = z.infer<typeof transactionStatusSchema>;
 
+export const spendingTransactionSchema = transactionSchema.extend({
+  effectiveDate: isoDateSchema.describe("Date the Worker used to include this debit in the requested range"),
+  dateSource: z.enum(["transaction_date", "booking_date", "value_date"])
+    .describe("Source of effectiveDate; booking_date and value_date are inferred fallbacks, not verified purchase dates"),
+});
+export type SpendingTransaction = z.infer<typeof spendingTransactionSchema>;
+
 export interface SpendingDateResolution {
   effectiveDate?: string;
   inferred: boolean;
+  source: "transaction_date" | "booking_date" | "value_date" | "unknown";
 }
 
 export function resolveSpendingDate(
   transaction: Pick<Transaction, "transactionDate" | "bookingDate" | "valueDate">,
 ): SpendingDateResolution {
   if (transaction.transactionDate !== undefined) {
-    return { effectiveDate: transaction.transactionDate, inferred: false };
+    return { effectiveDate: transaction.transactionDate, inferred: false, source: "transaction_date" };
   }
 
-  const fallbackDates = [transaction.bookingDate, transaction.valueDate].filter(
-    (date): date is string => date !== undefined,
-  );
-  if (fallbackDates.length === 0) return { inferred: true };
-
-  return {
-    effectiveDate: fallbackDates.reduce((earliest, date) =>
-      date < earliest ? date : earliest,
-    ),
-    inferred: true,
-  };
+  if (transaction.bookingDate !== undefined &&
+      (transaction.valueDate === undefined || transaction.bookingDate <= transaction.valueDate)) {
+    return { effectiveDate: transaction.bookingDate, inferred: true, source: "booking_date" };
+  }
+  if (transaction.valueDate !== undefined) {
+    return { effectiveDate: transaction.valueDate, inferred: true, source: "value_date" };
+  }
+  return { inferred: true, source: "unknown" };
 }
 
 export interface TransactionPage {

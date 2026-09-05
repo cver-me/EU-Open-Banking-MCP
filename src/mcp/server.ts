@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/server";
-import Decimal from "decimal.js";
+import type Decimal from "decimal.js";
 import { z } from "zod";
 import type { AppConfig } from "../config";
-import { errorMessage } from "../errors";
+import { errorMessage, PublicError } from "../errors";
 import {
   accountIdSchema,
   accountReadErrorSchema,
@@ -13,11 +13,14 @@ import {
   isoDateSchema,
   nonNegativeDecimalAmountSchema,
   resolveSpendingDate,
+  spendingTransactionSchema,
   transactionSchema,
   transactionStatusSchema,
   type Transaction,
   type TransactionStatus,
+  type SpendingTransaction,
 } from "../finance";
+import { Money } from "../money";
 import { EnableBankingClient } from "../providers/enable-banking/client";
 import type { EnableBankingPsuHeaders } from "../providers/enable-banking/psu-headers";
 import type { SessionStore } from "../session-store";
@@ -28,7 +31,12 @@ const MAX_SEARCH_PAGES = 5;
 const MAX_SUMMARY_PAGES = 20;
 const MAX_SUMMARY_TRANSACTIONS = 10_000;
 const SPENDING_DATE_PADDING_DAYS = 7;
-const SPENDING_STATUSES = new Set<TransactionStatus>(["booked", "held", "other", "pending"]);
+const scanIncompleteReasonSchema = z.enum(["page_limit", "transaction_limit", "repeated_cursor"]);
+type ScanIncompleteReason = z.infer<typeof scanIncompleteReasonSchema>;
+const spendingIncompleteReasonSchema = z.enum([
+  ...scanIncompleteReasonSchema.options, "inferred_dates", "missing_dates", "unknown_status",
+]);
+type SpendingIncompleteReason = z.infer<typeof spendingIncompleteReasonSchema>;
 
 const annotations = {
   readOnlyHint: true,
@@ -53,7 +61,7 @@ const dateRangeSchema = z
       });
     }
     if (days < 0) context.addIssue({ code: "custom", message: "dateTo must not precede dateFrom" });
-    if (days > MAX_DATE_RANGE_DAYS) {
+    if (days + 1 > MAX_DATE_RANGE_DAYS) {
       context.addIssue({ code: "custom", message: `Date range cannot exceed ${MAX_DATE_RANGE_DAYS} days` });
     }
   });
@@ -137,17 +145,22 @@ export function createFinanceServer(
     {
       title: "Get spending",
       description:
-        "Return debit spending for a date range across all accounts by default. Uses the bank-reported transaction date when available; otherwise uses the earlier booking or value date as an inferred fallback, and includes pending transactions.",
-      inputSchema: dateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
+        "Estimate gross debit spending for a date range across all accounts or one account. Uses transaction date with an inferred booking/value-date fallback; includes pending transactions and holds, separated in totalsByStatus. Transfers and repayments may be included; refunds are not subtracted. Undated and unknown-status debits are excluded. Check complete and incompleteReasons. Set includeTransactions for itemization and date provenance.",
+      inputSchema: dateRangeSchema.extend({
+        accountId: accountIdSchema.optional(),
+        includeTransactions: z.boolean().default(false)
+          .describe("Include up to 200 supporting transactions when itemization is needed; omitted by default to keep summaries concise"),
+      }),
       outputSchema: z.object({
         totalsByCurrency: z.record(
           currencySchema,
           nonNegativeDecimalAmountSchema.describe(
-            "Exact total of matching debit activity in this currency",
+            "Gross sum of matching booked, pending, and held debits; use totalsByStatus to distinguish settled activity",
           ),
         ),
         transactions: z
-          .array(transactionSchema)
+          .array(spendingTransactionSchema)
+          .optional()
           .describe("Matching debit transactions, capped at 200 records"),
         transactionsIncluded: z
           .number()
@@ -155,23 +168,35 @@ export function createFinanceServer(
           .describe("Number of matching transactions included in the totals"),
         transactionDetailsComplete: z
           .boolean()
+          .optional()
           .describe("True when every transaction included in the totals is returned in transactions"),
         complete: z
           .boolean()
           .describe(
-            "True when spending for the requested range was fully determined without inferred transaction dates",
+            "True when the bounded scan finished without uncertain dates or statuses; not a guarantee of the bank's historical coverage",
           ),
         pagesScanned: z.number().int().describe("Total provider pages scanned"),
+        totalsByStatus: z.object({
+          booked: z.record(currencySchema, nonNegativeDecimalAmountSchema),
+          pending: z.record(currencySchema, nonNegativeDecimalAmountSchema),
+          held: z.record(currencySchema, nonNegativeDecimalAmountSchema),
+        }).describe("Separate gross debit totals by lifecycle status; pending and held amounts are not settled spending"),
+        incompleteReasons: z.array(spendingIncompleteReasonSchema),
       }),
       annotations,
     },
-    async ({ accountId, dateFrom, dateTo }) =>
+    async ({ accountId, dateFrom, dateTo, includeTransactions }) =>
       safeResult(async () => {
         const accountIds = accountId === undefined ? await provider.listAccountIds() : [accountId];
         const totals = new Map<string, Decimal>();
-        const transactions: Transaction[] = [];
+        const statusTotals = {
+          booked: new Map<string, Decimal>(),
+          pending: new Map<string, Decimal>(),
+          held: new Map<string, Decimal>(),
+        };
+        const transactions: SpendingTransaction[] = [];
         let transactionsIncluded = 0;
-        let occurrenceCoverageComplete = true;
+        const incompleteReasons = new Set<SpendingIncompleteReason>();
         const providerDateFrom = addDays(dateFrom, -SPENDING_DATE_PADDING_DAYS);
         const providerDateTo = earlierDate(
           addDays(dateTo, SPENDING_DATE_PADDING_DAYS),
@@ -183,41 +208,58 @@ export function createFinanceServer(
           accountIds,
           { dateFrom: providerDateFrom, dateTo: providerDateTo },
           (transaction) => {
-            if (
-              transaction.direction !== "debit" ||
-              !SPENDING_STATUSES.has(transaction.status)
-            ) {
+            if (transaction.direction !== "debit") return;
+            const amount = new Money(transaction.amount);
+            if (amount.isZero()) return;
+            if (transaction.status === "other") {
+              incompleteReasons.add("unknown_status");
               return;
             }
-            const amount = new Decimal(transaction.amount);
-            if (amount.isZero()) return;
+            if (transaction.status !== "booked" && transaction.status !== "pending" && transaction.status !== "held") return;
             const dateResolution = resolveSpendingDate(transaction);
+            if (dateResolution.effectiveDate === undefined || dateResolution.source === "unknown") {
+              incompleteReasons.add("missing_dates");
+              return;
+            }
+            // Inference can also exclude a payment that actually occurred in the range.
+            if (dateResolution.inferred) incompleteReasons.add("inferred_dates");
             const matchesRequestedDate =
-              dateResolution.effectiveDate === undefined ||
               (dateResolution.effectiveDate >= dateFrom && dateResolution.effectiveDate <= dateTo);
             if (!matchesRequestedDate) return;
-            if (dateResolution.inferred) occurrenceCoverageComplete = false;
 
             totals.set(
               transaction.currency,
-              (totals.get(transaction.currency) ?? new Decimal(0)).plus(amount),
+              (totals.get(transaction.currency) ?? new Money(0)).plus(amount),
             );
+            const byCurrency = statusTotals[transaction.status];
+            byCurrency.set(transaction.currency, (byCurrency.get(transaction.currency) ?? new Money(0)).plus(amount));
             transactionsIncluded += 1;
-            if (transactions.length < MAX_TRANSACTIONS_PER_RESULT) {
-              transactions.push(transaction);
+            if (includeTransactions && transactions.length < MAX_TRANSACTIONS_PER_RESULT) {
+              transactions.push({
+                ...transaction,
+                effectiveDate: dateResolution.effectiveDate,
+                dateSource: dateResolution.source,
+              });
             }
           },
         );
 
+        for (const reason of scan.incompleteReasons) incompleteReasons.add(reason);
         return {
           totalsByCurrency: Object.fromEntries(
             [...totals.entries()].map(([currency, total]) => [currency, total.toFixed()]),
           ),
-          transactions,
+          ...(includeTransactions ? {
+            transactions,
+            transactionDetailsComplete: transactions.length === transactionsIncluded,
+          } : {}),
           transactionsIncluded,
-          transactionDetailsComplete: transactions.length === transactionsIncluded,
-          complete: scan.complete && occurrenceCoverageComplete,
+          complete: incompleteReasons.size === 0,
           pagesScanned: scan.pagesScanned,
+          totalsByStatus: Object.fromEntries(Object.entries(statusTotals).map(([status, byCurrency]) => [
+            status, Object.fromEntries([...byCurrency].map(([currency, total]) => [currency, total.toFixed()])),
+          ])),
+          incompleteReasons: [...incompleteReasons],
         };
       }),
   );
@@ -227,7 +269,7 @@ export function createFinanceServer(
     {
       title: "List transactions",
       description:
-        "Return a paginated page of bank-reported transaction records for one account, optionally filtered by lifecycle status.",
+        "Return a paginated page of bank-reported transaction records for one account, optionally filtered by lifecycle status. Dates are passed to the bank's date-range filter; they do not guarantee purchase-date filtering. An empty page can still have nextCursor. Cursors re-read live provider pages and are not stable snapshots.",
       inputSchema: transactionFiltersSchema.extend({
         accountId: accountIdSchema,
         limit: z
@@ -300,7 +342,7 @@ export function createFinanceServer(
     {
       title: "Search transactions",
       description:
-        "Search normalized transaction descriptions and counterparties over a bounded date range and provider pages.",
+        "Search normalized transaction descriptions, counterparties, entry/payment references, and bank classification descriptions over a bounded date range and provider pages. Date filters use the bank's semantics, not guaranteed purchase dates.",
       inputSchema: transactionFiltersSchema.extend({
         accountId: accountIdSchema,
         query: z
@@ -308,7 +350,7 @@ export function createFinanceServer(
           .trim()
           .min(2)
           .max(100)
-          .describe("Case-insensitive text to match against description, counterparty, or reference"),
+          .describe("Case-insensitive text to match against description, counterparty, entry/payment references, or bank classification description"),
         limit: z
           .number()
           .int()
@@ -333,8 +375,13 @@ export function createFinanceServer(
         let continuationKey: string | undefined;
         let pagesScanned = 0;
         let stoppedAtLimit = false;
+        const visitedCursors = new Set<string>();
 
         do {
+          if (continuationKey !== undefined) {
+            if (visitedCursors.has(continuationKey)) break;
+            visitedCursors.add(continuationKey);
+          }
           const page = await provider.listTransactions(accountId, {
             dateFrom,
             dateTo,
@@ -342,14 +389,15 @@ export function createFinanceServer(
             ...(continuationKey === undefined ? {} : { continuationKey }),
           });
           pagesScanned += 1;
-          for (const transaction of page.transactions) {
-            const haystack = [transaction.counterparty, transaction.description, transaction.reference]
+          for (const [index, transaction] of page.transactions.entries()) {
+            const haystack = [transaction.counterparty, transaction.description, transaction.reference,
+              transaction.paymentReference, transaction.bankTransactionDescription]
               .filter((part): part is string => part !== undefined)
               .join(" ")
               .toLocaleLowerCase();
             if (haystack.includes(needle)) matches.push(transaction);
             if (matches.length >= limit) {
-              stoppedAtLimit = true;
+              stoppedAtLimit = index + 1 < page.transactions.length;
               break;
             }
           }
@@ -373,7 +421,7 @@ export function createFinanceServer(
     {
       title: "Summarize cash flow",
       description:
-        "Return booked credit, debit, and net accounting totals by currency for a date range.",
+        "Return booked credit, debit, and net account-flow totals by currency for the bank-filtered date range. These are gross account flows: credits are not necessarily income and debits are not necessarily expenses; internal transfers and card repayments are not eliminated. Only booked records are included.",
       inputSchema: dateRangeSchema.extend({ accountId: accountIdSchema.optional() }),
       outputSchema: z.object({
         totalsByCurrency: z.record(
@@ -389,6 +437,7 @@ export function createFinanceServer(
           .boolean()
           .describe("True only when all active accounts and provider pages were included"),
         pagesScanned: z.number().int().describe("Total provider pages included in the summary"),
+        incompleteReasons: z.array(scanIncompleteReasonSchema),
       }),
       annotations,
     },
@@ -403,8 +452,8 @@ export function createFinanceServer(
           { dateFrom, dateTo, status: "booked" },
           (transaction) => {
             const current = totals.get(transaction.currency) ?? {
-              credit: new Decimal(0),
-              debit: new Decimal(0),
+              credit: new Money(0),
+              debit: new Money(0),
             };
             current[transaction.direction] = current[transaction.direction].plus(transaction.amount);
             totals.set(transaction.currency, current);
@@ -427,6 +476,7 @@ export function createFinanceServer(
           transactionsIncluded,
           complete: scan.complete,
           pagesScanned: scan.pagesScanned,
+          incompleteReasons: scan.incompleteReasons,
         };
       }),
   );
@@ -439,18 +489,29 @@ async function scanSummaryTransactions(
   accountIds: string[],
   filters: { dateFrom: string; dateTo: string; status?: TransactionStatus },
   visit: (transaction: Transaction) => void,
-): Promise<{ complete: boolean; pagesScanned: number }> {
+): Promise<{ complete: boolean; pagesScanned: number; incompleteReasons: ScanIncompleteReason[] }> {
   let transactionsScanned = 0;
   let pagesScanned = 0;
   let complete = true;
+  const incompleteReasons = new Set<ScanIncompleteReason>();
 
   outer: for (const accountId of accountIds) {
     if (pagesScanned >= MAX_SUMMARY_PAGES) {
       complete = false;
+      incompleteReasons.add("page_limit");
       break;
     }
     let continuationKey: string | undefined;
+    const visitedCursors = new Set<string>();
     do {
+      if (continuationKey !== undefined) {
+        if (visitedCursors.has(continuationKey)) {
+          complete = false;
+          incompleteReasons.add("repeated_cursor");
+          break;
+        }
+        visitedCursors.add(continuationKey);
+      }
       const page = await provider.listTransactions(accountId, {
         dateFrom: filters.dateFrom,
         dateTo: filters.dateTo,
@@ -459,22 +520,32 @@ async function scanSummaryTransactions(
       });
       pagesScanned += 1;
       for (const transaction of page.transactions) {
-        transactionsScanned += 1;
-        visit(transaction);
         if (transactionsScanned >= MAX_SUMMARY_TRANSACTIONS) {
           complete = false;
+          incompleteReasons.add("transaction_limit");
           break outer;
         }
+        transactionsScanned += 1;
+        visit(transaction);
       }
       continuationKey = page.continuationKey;
+      if (
+        transactionsScanned >= MAX_SUMMARY_TRANSACTIONS &&
+        (continuationKey !== undefined || accountId !== accountIds.at(-1))
+      ) {
+        complete = false;
+        incompleteReasons.add("transaction_limit");
+        break outer;
+      }
       if (pagesScanned >= MAX_SUMMARY_PAGES && continuationKey !== undefined) {
         complete = false;
+        incompleteReasons.add("page_limit");
         break outer;
       }
     } while (continuationKey !== undefined);
   }
 
-  return { complete, pagesScanned };
+  return { complete, pagesScanned, incompleteReasons: [...incompleteReasons] };
 }
 
 async function safeResult<T extends Record<string, unknown>>(
@@ -508,7 +579,10 @@ function decodeCursor(cursor: string): PageCursor {
       offset: parsed.offset,
     };
   } catch {
-    throw new Error("Invalid transaction cursor");
+    throw new PublicError(
+      "Invalid transaction cursor. Omit cursor to restart pagination.",
+      "invalid_cursor",
+    );
   }
 }
 
@@ -523,7 +597,10 @@ function validateCursor(
     cursor.dateTo !== filters.dateTo ||
     cursor.status !== filters.status
   ) {
-    throw new Error("The transaction cursor does not match the current filters");
+    throw new PublicError(
+      "The transaction cursor does not match the current filters. Omit cursor to restart pagination.",
+      "cursor_filter_mismatch",
+    );
   }
 }
 

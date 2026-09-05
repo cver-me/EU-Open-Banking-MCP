@@ -249,7 +249,7 @@ describe("Worker boundary", () => {
     expect(spendingTool?.description).toContain("includes pending transactions");
     expect(spendingTool?.outputSchema?.properties).not.toHaveProperty("dateCoverageComplete");
     expect(spendingTool?.outputSchema?.properties?.complete?.description).toContain(
-      "fully determined",
+      "bounded scan finished",
     );
 
     expect(transactionTool?.description).toContain("for one account");
@@ -259,7 +259,7 @@ describe("Worker boundary", () => {
       ({ name }) => name === "finance_summarize_cash_flow",
     );
     expect(cashFlowTool?.description).toContain(
-      "booked credit, debit, and net accounting totals",
+      "booked credit, debit, and net account-flow totals",
     );
   });
 
@@ -359,7 +359,7 @@ describe("Worker boundary", () => {
     const response = await callTool(
       3,
       "finance_get_spending",
-      { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
+      { dateFrom: "2026-08-24", dateTo: "2026-08-24", includeTransactions: true },
       {
         ...env,
         ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
@@ -381,12 +381,16 @@ describe("Worker boundary", () => {
           status: "pending",
           bookingDate: "2026-08-24",
           counterparty: "Bar Prima Porta",
+          effectiveDate: "2026-08-24",
+          dateSource: "booking_date",
         },
       ],
       transactionsIncluded: 1,
       transactionDetailsComplete: true,
       complete: false,
       pagesScanned: 2,
+      totalsByStatus: { booked: {}, pending: { EUR: "3.7" }, held: {} },
+      incompleteReasons: ["inferred_dates"],
     });
     expect(JSON.stringify(payload)).not.toContain("Licari Group");
     expect(fetchMock).toHaveBeenCalledTimes(4);
@@ -425,7 +429,7 @@ describe("Worker boundary", () => {
     const response = await callTool(
       4,
       "finance_get_spending",
-      { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
+      { dateFrom: "2026-08-24", dateTo: "2026-08-24", includeTransactions: true },
       {
         ...env,
         ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
@@ -446,12 +450,16 @@ describe("Worker boundary", () => {
           direction: "debit",
           status: "booked",
           bookingDate: "2026-08-24",
+          effectiveDate: "2026-08-24",
+          dateSource: "booking_date",
         },
       ],
       transactionsIncluded: 1,
       transactionDetailsComplete: true,
       complete: false,
       pagesScanned: 1,
+      totalsByStatus: { booked: { EUR: "5" }, pending: {}, held: {} },
+      incompleteReasons: ["inferred_dates"],
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -502,7 +510,7 @@ describe("Worker boundary", () => {
     const response = await callTool(
       5,
       "finance_get_spending",
-      { dateFrom: "2026-08-24", dateTo: "2026-08-24" },
+      { dateFrom: "2026-08-24", dateTo: "2026-08-24", includeTransactions: true },
       {
         ...env,
         ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
@@ -580,6 +588,7 @@ describe("Worker boundary", () => {
     };
     expect(payload.result.structuredContent).toEqual({
       totalsByCurrency: { EUR: { credit: "5", debit: "2", net: "3" } },
+      incompleteReasons: [],
       transactionsIncluded: 2,
       complete: true,
       pagesScanned: 2,
@@ -598,6 +607,241 @@ describe("Worker boundary", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("dateFrom must not be in the future");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("Finance scan regressions", () => {
+  const dateRange = { dateFrom: "2026-08-01", dateTo: "2026-08-24" };
+  const transaction = {
+    transaction_amount: { amount: "0.01", currency: "EUR" },
+    credit_debit_indicator: "DBIT",
+    status: "BOOK",
+    note: "Example purchase",
+  };
+
+  async function mockPages(page: (url: URL) => Record<string, unknown>) {
+    await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
+    return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/sessions/${INTESA_SESSION_ID}`) {
+        return Response.json({
+          status: "AUTHORIZED",
+          accounts: [INTESA_ACCOUNT_ID],
+          aspsp: { name: "Example Bank", country: "DE" },
+          psu_type: "personal",
+        });
+      }
+      expect(url.pathname).toBe(`/accounts/${INTESA_ACCOUNT_ID}/transactions`);
+      return Response.json(page(url));
+    });
+  }
+
+  async function invoke(name: string, args: Record<string, unknown> = {}) {
+    const response = await callTool(10, name, { ...dateRange, ...args }, {
+      ...env,
+      ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
+    });
+    return await response.json() as {
+      result: {
+        isError?: boolean;
+        content: { type: string; text: string }[];
+        structuredContent: {
+          complete: boolean;
+          pagesScanned: number;
+          transactionsIncluded: number;
+          transactions: Record<string, unknown>[];
+          totalsByCurrency: Record<string, unknown>;
+          nextCursor?: string;
+        };
+      };
+    };
+  }
+
+  it("explains malformed cursors without calling the provider", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const { result } = await invoke("finance_list_transactions", {
+      accountId: INTESA_ACCOUNT_ID,
+      cursor: "invalid-cursor",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("Invalid transaction cursor");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cursor reused with different filters before provider access", async () => {
+    const fetchMock = await mockPages(() => ({ transactions: [transaction, transaction] }));
+    const first = await invoke("finance_list_transactions", {
+      accountId: INTESA_ACCOUNT_ID, limit: 1,
+    });
+    expect(first.result.structuredContent.nextCursor).toBeDefined();
+    fetchMock.mockClear();
+    const { result } = await invoke("finance_list_transactions", {
+      accountId: INTESA_ACCOUNT_ID,
+      cursor: first.result.structuredContent.nextCursor,
+      status: "booked",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("does not match the current filters");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("reports search completeness at the result boundary (more=%s)", async (more) => {
+    await mockPages(() => ({ transactions: more ? [transaction, transaction] : [transaction] }));
+    const { result } = await invoke("finance_search_transactions", {
+      accountId: INTESA_ACCOUNT_ID, query: "example", limit: 1,
+    });
+    expect(result.structuredContent.transactions).toHaveLength(1);
+    expect(result.structuredContent.complete).toBe(!more);
+  });
+
+  it.each(["finance_search_transactions", "finance_summarize_cash_flow"])(
+    "%s stops before fetching a repeated continuation key",
+    async (name) => {
+      const fetchMock = await mockPages(() => ({
+        transactions: [transaction], continuation_key: "repeated-page",
+      }));
+      const { result } = await invoke(name, { accountId: INTESA_ACCOUNT_ID, query: "example" });
+      expect(result.structuredContent).toMatchObject({ complete: false, pagesScanned: 2 });
+      if (name === "finance_summarize_cash_flow") {
+        expect(result.structuredContent).toMatchObject({
+          transactionsIncluded: 2,
+          totalsByCurrency: { EUR: { credit: "0", debit: "0.02", net: "-0.02" } },
+        });
+      } else {
+        expect(result.structuredContent.transactions).toHaveLength(2);
+      }
+      // One session request and two distinct provider pages, rather than 5 or 20 pages.
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it.each([false, true])("reports summary completeness at 10,000 transactions (more=%s)", async (more) => {
+    const fetchMock = await mockPages((url) => ({
+      transactions: Array.from({ length: 5_000 }, () => transaction),
+      continuation_key: url.searchParams.has("continuation_key")
+        ? (more ? "third-page" : null) : "second-page",
+    }));
+    const { result } = await invoke("finance_summarize_cash_flow");
+    expect(result.structuredContent).toEqual({
+      complete: !more,
+      incompleteReasons: more ? ["transaction_limit"] : [],
+      pagesScanned: 2,
+      transactionsIncluded: 10_000,
+      totalsByCurrency: { EUR: { credit: "0", debit: "100", net: "-100" } },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("marks spending uncertain when an inferred date excludes a debit", async () => {
+    await mockPages(() => ({
+      transactions: [{ ...transaction, booking_date: "2026-08-25" }],
+    }));
+    const { result } = await invoke("finance_get_spending", { includeTransactions: true });
+    expect(result.structuredContent).toMatchObject({
+      complete: false, transactionsIncluded: 0, totalsByCurrency: {},
+    });
+  });
+
+  it("keeps gross debits separate by status and explains date exclusions", async () => {
+    const debit = (amount: string, status: string, dates: Record<string, string> = {}) => ({
+      ...transaction, transaction_amount: { amount, currency: "EUR" }, status, ...dates,
+    });
+    await mockPages(() => ({ transactions: [
+      debit("10", "BOOK", { transaction_date: "2026-08-22", booking_date: "2026-08-25" }),
+      debit("2", "BOOK", { booking_date: "2026-08-22", value_date: "2026-08-20" }),
+      debit("3", "HOLD", { transaction_date: "2026-08-22" }),
+      debit("4", "PDNG", { transaction_date: "2026-08-22" }),
+      debit("500", "OTHR", { transaction_date: "2026-08-22" }),
+      debit("600", "BOOK"),
+      ...["CNCL", "RJCT", "SCHD"].map((status) => debit("700", status, { transaction_date: "2026-08-22" })),
+      { ...debit("800", "BOOK", { transaction_date: "2026-08-22" }), credit_debit_indicator: "CRDT" },
+    ] }));
+    const { result } = await invoke("finance_get_spending", { includeTransactions: true });
+    expect(result.structuredContent).toMatchObject({
+      complete: false,
+      totalsByCurrency: { EUR: "19" },
+      totalsByStatus: { booked: { EUR: "12" }, held: { EUR: "3" }, pending: { EUR: "4" } },
+      transactionsIncluded: 4,
+      incompleteReasons: ["inferred_dates", "unknown_status", "missing_dates"],
+    });
+    expect(result.structuredContent.transactions[0]).toMatchObject({
+      effectiveDate: "2026-08-22", dateSource: "transaction_date", bookingDate: "2026-08-25",
+    });
+    expect(result.structuredContent.transactions[1]).toMatchObject({
+      effectiveDate: "2026-08-20", dateSource: "value_date", bookingDate: "2026-08-22",
+    });
+  });
+
+  it("keeps full spending totals when only transaction details are truncated", async () => {
+    await mockPages(() => ({ transactions: Array.from({ length: 201 }, () => ({
+      ...transaction, transaction_date: "2026-08-22",
+    })) }));
+    const { result } = await invoke("finance_get_spending", { includeTransactions: true });
+    expect(result.structuredContent).toMatchObject({
+      complete: true, incompleteReasons: [], transactionsIncluded: 201,
+      transactionDetailsComplete: false, totalsByCurrency: { EUR: "2.01" },
+    });
+    expect(result.structuredContent.transactions).toHaveLength(200);
+  });
+
+  it("returns concise spending by default with identical totals and warnings to the detailed response", async () => {
+    await mockPages(() => ({ transactions: Array.from({ length: 20 }, () => ({
+      ...transaction, booking_date: "2026-08-22", creditor: { name: "Example merchant" },
+    })) }));
+    const concise = (await invoke("finance_get_spending")).result.structuredContent;
+    const detailed = (await invoke("finance_get_spending", { includeTransactions: true })).result.structuredContent;
+    const { transactions, transactionDetailsComplete: _detailsComplete, ...summary } = detailed as typeof detailed & {
+      transactionDetailsComplete: boolean;
+    };
+    expect(concise).toEqual(summary);
+    expect(concise).toMatchObject({ totalsByCurrency: { EUR: "0.2" }, complete: false, incompleteReasons: ["inferred_dates"] });
+    expect(concise).not.toHaveProperty("transactions");
+    expect(concise).not.toHaveProperty("providerDateRange");
+    expect(transactions).toHaveLength(20);
+    expect(JSON.stringify(concise).length).toBeLessThan(JSON.stringify(detailed).length / 5);
+  });
+
+  it("sums precise booked flows even if the provider ignores its status filter", async () => {
+    const entry = (amount: string, indicator: string, status = "BOOK") => ({
+      ...transaction, transaction_amount: { amount, currency: "EUR" }, credit_debit_indicator: indicator, status,
+    });
+    await mockPages(() => ({ transactions: [
+      entry("12345678901234567890.12", "CRDT"), entry("0.01", "CRDT"),
+      entry("0.02", "DBIT"), entry("99", "DBIT", "PDNG"),
+    ] }));
+    const { result } = await invoke("finance_summarize_cash_flow");
+    expect(result.structuredContent).toMatchObject({
+      transactionsIncluded: 3,
+      totalsByCurrency: { EUR: { credit: "12345678901234567890.13", debit: "0.02", net: "12345678901234567890.11" } },
+    });
+  });
+
+  it.each(["invoice-2", "transfer received"])("searches preserved provider metadata: %s", async (query) => {
+    await mockPages(() => ({ transactions: [{
+      ...transaction, reference_number: "invoice-2",
+      bank_transaction_code: { description: "Transfer received" },
+    }] }));
+    const { result } = await invoke("finance_search_transactions", { accountId: INTESA_ACCOUNT_ID, query });
+    expect(result.structuredContent.transactions).toHaveLength(1);
+    expect(result.structuredContent.complete).toBe(true);
+  });
+
+  it.each([
+    { dateTo: "2024-12-31", accepted: true },
+    { dateTo: "2025-01-01", accepted: false },
+  ])("bounds inclusive date ranges: $dateTo", async ({ dateTo, accepted }) => {
+    const fetchMock = await mockPages(() => ({ transactions: [] }));
+    const { result } = await invoke("finance_list_transactions", {
+      accountId: INTESA_ACCOUNT_ID, dateFrom: "2024-01-01", dateTo,
+    });
+    if (accepted) {
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent.transactions).toEqual([]);
+    } else {
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain("cannot exceed 366 days");
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
   });
 });
 
