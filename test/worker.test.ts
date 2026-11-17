@@ -608,6 +608,34 @@ describe("Worker boundary", () => {
     expect(await response.text()).toContain("dateFrom must not be in the future");
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("rejects oversized tool arguments before validation or provider access", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const response = await callTool(3, "finance_list_accounts", {
+      padding: Array.from({ length: 100 }, (_, index) => index),
+    });
+
+    expect(response.status).toBe(200);
+    const { result } = await response.json() as {
+      result: { isError?: boolean; content: { text: string }[] };
+    };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("more than the maximum of 32 elements");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized MCP request bodies before parsing", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const response = await callTool(4, "finance_search_transactions", {
+      accountId: INTESA_ACCOUNT_ID,
+      dateFrom: "2026-08-01",
+      dateTo: "2026-08-24",
+      query: "x".repeat(70 * 1024),
+    });
+
+    expect(response.status).toBe(413);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("Finance scan regressions", () => {

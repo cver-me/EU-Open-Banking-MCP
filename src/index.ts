@@ -15,6 +15,9 @@ const SECURITY_HEADERS = {
   "X-Frame-Options": "DENY",
 } as const;
 
+// MCP requests here are small JSON-RPC calls (largest field: an 8 KiB cursor).
+const MAX_MCP_REQUEST_BODY_BYTES = 64 * 1024;
+
 export default {
   async fetch(request, env, context): Promise<Response> {
     // Worker-level Cloudflare Access validates the request before invocation.
@@ -51,6 +54,7 @@ export default {
       corsOptions: false,
       legacy: "stateless",
       responseMode: "auto",
+      maxRequestBodySize: MAX_MCP_REQUEST_BODY_BYTES,
       onerror(error) {
         console.error(JSON.stringify({ message: "MCP request failed", errorType: error.name }));
       },

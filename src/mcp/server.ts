@@ -30,6 +30,9 @@ const MAX_TRANSACTIONS_PER_RESULT = 200;
 const MAX_SEARCH_PAGES = 5;
 const MAX_SUMMARY_PAGES = 20;
 const MAX_SUMMARY_TRANSACTIONS = 10_000;
+// Every tool takes a handful of flat scalar arguments. Reject oversized
+// argument payloads before zod validation runs on them.
+const MAX_TOOL_INPUT_ELEMENTS = 32;
 const SPENDING_DATE_PADDING_DAYS = 7;
 const scanIncompleteReasonSchema = z.enum(["page_limit", "transaction_limit", "repeated_cursor"]);
 type ScanIncompleteReason = z.infer<typeof scanIncompleteReasonSchema>;
@@ -105,7 +108,10 @@ export function createFinanceServer(
   psuHeaders?: EnableBankingPsuHeaders,
 ): McpServer {
   const provider = new EnableBankingClient(config, sessions, psuHeaders);
-  const server = new McpServer({ name: "personal-finance-eu-mcp", version: "0.1.0" });
+  const server = new McpServer(
+    { name: "personal-finance-eu-mcp", version: "0.1.0" },
+    { maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS },
+  );
 
   server.registerTool(
     "finance_list_accounts",
