@@ -21,9 +21,10 @@ import {
   type TransactionStatus,
   type SpendingTransaction,
 } from "../finance";
+import { base64UrlDecode, base64UrlEncode } from "../lib/crypto";
 import { addDays, differenceInDays, earlierDate, todayIsoDate } from "../lib/dates";
 import { Money } from "../lib/money";
-import type { AggregateFinanceProvider } from "../aggregate";
+import type { Aggregate } from "../aggregate";
 
 const MAX_DATE_RANGE_DAYS = 366;
 const MAX_TRANSACTIONS_PER_RESULT = 200;
@@ -61,7 +62,7 @@ const dateRangeSchema = z
   })
   .superRefine(({ dateFrom, dateTo }, context) => {
     const days = differenceInDays(dateFrom, dateTo);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayIsoDate();
     if (dateFrom > today) {
       context.addIssue({
         code: "custom",
@@ -108,7 +109,7 @@ const pageCursorSchema = z.object({
   offset: z.number().int().min(0).max(5_000),
 });
 
-export function createFinanceServer(provider: AggregateFinanceProvider): McpServer {
+export function createFinanceServer(provider: Aggregate): McpServer {
   const server = new McpServer(
     { name: "personal-finance-eu-mcp", version: "0.1.0" },
     { maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS },
@@ -119,7 +120,7 @@ export function createFinanceServer(provider: AggregateFinanceProvider): McpServ
     {
       title: "List financial accounts",
       description:
-        "Discover accounts from active bank connections (EU banks via Enable Banking, UK banks via TrueLayer) and return opaque account IDs with bank-provided metadata. Never returns IBANs or account numbers.",
+        "Discover accounts from every active bank connection and return opaque account IDs with bank-provided metadata. Never returns IBANs or account numbers. If a data provider cannot be read, its accounts are missing and providerErrors says which.",
       inputSchema: z.object({}),
       outputSchema: z.object({ accounts: z.array(accountSummarySchema), providerErrors: providerErrorsSchema }),
       annotations,
@@ -313,7 +314,7 @@ export function createFinanceServer(provider: AggregateFinanceProvider): McpServ
         historyUnavailable: z
           .literal(true)
           .optional()
-          .describe("The bank refused to share part of this date range (usually history older than about 90 days for UK banks); no older pages follow"),
+          .describe("The bank refused to share part of this date range (some banks limit how far back a connection may read); no older pages follow"),
       }),
       annotations,
     },
@@ -517,7 +518,7 @@ export function createFinanceServer(provider: AggregateFinanceProvider): McpServ
 }
 
 async function selectAccountIds(
-  provider: AggregateFinanceProvider,
+  provider: Aggregate,
   accountId: string | undefined,
 ): Promise<{ accountIds: string[]; providerErrors: ProviderError[] }> {
   if (accountId !== undefined) return { accountIds: [accountId], providerErrors: [] };
@@ -530,7 +531,7 @@ function withProviderErrors(providerErrors: ProviderError[]): { providerErrors?:
 }
 
 async function scanSummaryTransactions(
-  provider: Pick<AggregateFinanceProvider, "listTransactions">,
+  provider: Pick<Aggregate, "listTransactions">,
   accountIds: string[],
   filters: { dateFrom: string; dateTo: string; status?: TransactionStatus },
   visit: (transaction: Transaction) => void,
@@ -612,12 +613,12 @@ async function safeResult<T extends Record<string, unknown>>(
 }
 
 function encodeCursor(cursor: PageCursor): string {
-  return base64UrlEncode(JSON.stringify(cursor));
+  return base64UrlEncode(new TextEncoder().encode(JSON.stringify(cursor)));
 }
 
 function decodeCursor(cursor: string): PageCursor {
   try {
-    const parsed = pageCursorSchema.parse(JSON.parse(base64UrlDecode(cursor)));
+    const parsed = pageCursorSchema.parse(JSON.parse(new TextDecoder().decode(base64UrlDecode(cursor))));
     return {
       v: parsed.v,
       accountId: parsed.accountId,
@@ -651,19 +652,5 @@ function validateCursor(
       "cursor_filter_mismatch",
     );
   }
-}
-
-function base64UrlEncode(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function base64UrlDecode(value: string): string {
-  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-  const binary = atob(padded);
-  return new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
 }
 

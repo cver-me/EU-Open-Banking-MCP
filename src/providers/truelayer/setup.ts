@@ -1,18 +1,17 @@
 import { z } from "zod";
-import { errorMessage, PublicError } from "../../errors";
 import { base64UrlEncode } from "../../lib/crypto";
 import {
   authorizationPage,
   callbackCookie,
-  errorPage,
   escapeHtml,
   html,
+  invalidState,
   methodNotAllowed,
-  readCookie,
+  readAuthorizationCallback,
   readForm,
   redirect,
   requireSameOrigin,
-  tokensMatch,
+  setupErrorResponse,
 } from "../../lib/web";
 import type { ProviderSetup } from "../types";
 import { trueLayerAuthorizationUrl, type TrueLayerClient, type TrueLayerConnectionSummary } from "./client";
@@ -57,28 +56,20 @@ export class TrueLayerSetup implements ProviderSetup {
         await this.client.removeConnection(z.uuid().parse(form.connectionId));
         return redirect("/setup?removed=1");
       }
-      // Callback
+      // Callback: the cookie carries state, the PKCE verifier, and optionally the connection to replace.
       if (request.method !== "GET") return methodNotAllowed();
-      if (url.searchParams.has("error")) {
-        throw new PublicError("Bank authorization was cancelled or denied.", "authorization_denied");
-      }
-      const code = z.string().min(1).max(4_096).parse(url.searchParams.get("code"));
-      const state = z.uuid().parse(url.searchParams.get("state"));
-      const [cookieState, codeVerifier, replaces, ...extra] = (readCookie(request, STATE_COOKIE) ?? "").split(".");
-      if (extra.length > 0) throw new PublicError("The authorization state did not match. Start again.", "invalid_state");
-      const parsedCookieState = z.uuid().parse(cookieState);
+      const { code, cookieFields: [codeVerifier, replaces, ...extra] } =
+        await readAuthorizationCallback(request, url, STATE_COOKIE);
+      if (extra.length > 0) throw invalidState();
       const parsedVerifier = z.string().regex(/^[A-Za-z0-9_-]{43,128}$/).parse(codeVerifier);
       const parsedReplaces = replaces === undefined ? undefined : z.uuid().parse(replaces);
-      if (!(await tokensMatch(state, parsedCookieState))) {
-        throw new PublicError("The authorization state did not match. Start again.", "invalid_state");
-      }
       const newId = await this.client.completeAuthorization(code, redirectUri, parsedVerifier);
       if (parsedReplaces !== undefined && await this.replaceIfSameBank(parsedReplaces, newId)) {
         return redirect("/setup?renewed=1", clearCookie);
       }
       return redirect("/setup?connected=1", clearCookie);
     } catch (error) {
-      return html(errorPage(errorMessage(error)), 400, clearCookie);
+      return setupErrorResponse(error, clearCookie);
     }
   }
 

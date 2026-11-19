@@ -1,7 +1,6 @@
 import { importPKCS8, SignJWT } from "jose";
 import { PublicError } from "../../errors";
 import type {
-  AccountReadError,
   AccountSummary,
   AccountUsage,
   Balance,
@@ -11,15 +10,19 @@ import type {
   TransactionPage,
   TransactionStatus,
 } from "../../finance";
-import { readBoundedJson } from "../../lib/http";
 import type { PsuContext } from "../../lib/psu";
 import {
-  accountReadError,
-  isBankRateLimit,
+  bankRateLimited,
+  groupBy,
   optionalText,
   parseProviderResponse,
-  providerTimeout as sharedProviderTimeout,
+  providerFetch,
+  providerTimeout,
+  readGroupedBalances,
+  readProviderErrorCode,
   setupRequired,
+  statusFallbackError,
+  uniqueBy,
   unknownAccount,
 } from "../shared";
 import type { BalanceReadResult, FinanceReader, TransactionQuery } from "../types";
@@ -45,7 +48,6 @@ import { enableBankingPsuHeaders, type EnableBankingPsuHeaders } from "./psu-hea
 
 const API_ORIGIN = "https://api.enablebanking.com";
 const PROVIDER_LABEL = "Enable Banking";
-const REQUEST_TIMEOUT_MS = 10_000;
 
 interface AuthorizedAccount {
   accountId: string;
@@ -132,7 +134,7 @@ export class EnableBankingClient implements FinanceReader {
   async listAccounts(): Promise<AccountSummary[]> {
     const accounts = await this.selectAccounts();
     const groupedResults = await Promise.all(
-      groupAccountsByInstitution(accounts).map(async (group) => {
+      groupBy(accounts, (account) => `${account.country}\u0000${account.institution}`).map(async (group) => {
         const summaries: AccountSummary[] = [];
         for (const { accountId, institution, country } of group) {
           const details = accountDetailsSchema.parse(
@@ -171,31 +173,10 @@ export class EnableBankingClient implements FinanceReader {
       return { balances: await this.getAccountBalances(account), errors: [] };
     }
 
-    const groupedResults = await Promise.all(
-      groupAccountsByInstitution(accounts).map(async (group) => {
-        const balances: Balance[] = [];
-        const errors: AccountReadError[] = [];
-        for (const [index, account] of group.entries()) {
-          try {
-            balances.push(...(await this.getAccountBalances(account)));
-          } catch (error) {
-            errors.push(accountReadError(account, error));
-            if (isBankRateLimit(error)) {
-              for (const skippedAccount of group.slice(index + 1)) {
-                errors.push(accountReadError(skippedAccount, error));
-              }
-              break;
-            }
-          }
-        }
-        return { balances, errors };
-      }),
+    return readGroupedBalances(
+      groupBy(accounts, (account) => `${account.country}\u0000${account.institution}`),
+      (account) => this.getAccountBalances(account),
     );
-
-    return {
-      balances: groupedResults.flatMap((result) => result.balances),
-      errors: groupedResults.flatMap((result) => result.errors),
-    };
   }
 
   private async getAccountBalances(account: AuthorizedAccount): Promise<Balance[]> {
@@ -456,54 +437,18 @@ export class EnableBankingClient implements FinanceReader {
     init: { method?: "DELETE" | "GET" | "POST"; body?: string } = {},
     includePsuHeaders = false,
   ): Promise<unknown> {
-    let response: Response;
-    try {
-      const headers = new Headers({
-        Accept: "application/json",
-        Authorization: `Bearer ${await this.authorizationToken()}`,
-      });
-      if (init.body !== undefined) headers.set("Content-Type", "application/json");
-      if (includePsuHeaders) applyPsuHeaders(headers, this.psuHeaders);
-      response = await fetch(`${API_ORIGIN}${path}`, {
-        method: init.method ?? "GET",
-        headers,
-        ...(init.body === undefined ? {} : { body: init.body }),
-        redirect: "manual",
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "TimeoutError") {
-        throw providerTimeout();
-      }
-      console.error(
-        JSON.stringify({
-          message: "Enable Banking fetch threw",
-          operation: providerOperation(path),
-          errorType: error instanceof Error ? error.name : typeof error,
-        }),
-      );
-      throw error;
-    }
-
-    if (response.status >= 300 && response.status < 400) {
-      console.warn(
-        JSON.stringify({
-          message: "Enable Banking redirect rejected",
-          operation: providerOperation(path),
-          status: response.status,
-        }),
-      );
-      throw new PublicError(
-        "Enable Banking returned an unexpected redirect.",
-        "provider_redirect_rejected",
-      );
-    }
-
-    if (!response.ok) {
-      throw await providerError(response, providerOperation(path));
-    }
-
-    return readBoundedJson(response);
+    const headers = new Headers({ Authorization: `Bearer ${await this.authorizationToken()}` });
+    if (includePsuHeaders) for (const [name, value] of this.psuHeaders ?? []) headers.set(name, value);
+    const operation = providerOperation(path);
+    return providerFetch({
+      url: `${API_ORIGIN}${path}`,
+      method: init.method ?? "GET",
+      headers,
+      ...(init.body === undefined ? {} : { body: init.body }),
+      providerLabel: PROVIDER_LABEL,
+      operation,
+      toError: (response) => providerError(response, operation),
+    });
   }
 }
 
@@ -513,31 +458,8 @@ function parseTransactionsResponse(value: unknown) {
   });
 }
 
-function providerTimeout(): PublicError {
-  return sharedProviderTimeout(PROVIDER_LABEL);
-}
-
-
 async function providerError(response: Response, operation: string): Promise<PublicError> {
-  let errorCode: string | undefined;
-  try {
-    const parsed = errorResponseSchema.safeParse(await readBoundedJson(response));
-    if (parsed.success) errorCode = parsed.data.error;
-  } catch {
-    // Status-based handling below remains safe when an error body is absent or malformed.
-  }
-
-  const retryAfter = response.headers.get("Retry-After");
-  console.warn(
-    JSON.stringify({
-      message: "Enable Banking request failed",
-      operation,
-      status: response.status,
-      errorCode: errorCode ?? "unknown",
-      ...(retryAfter === null || retryAfter.length > 100 ? {} : { retryAfter }),
-    }),
-  );
-
+  const errorCode = await readProviderErrorCode(response, errorResponseSchema, { providerLabel: PROVIDER_LABEL, operation });
   if (errorCode === "EXPIRED_SESSION" || errorCode === "REVOKED_SESSION" || errorCode === "CLOSED_SESSION") {
     return new PublicError(
       "Enable Banking authorization has expired or is no longer active. Reauthorize this account.",
@@ -550,42 +472,12 @@ async function providerError(response: Response, operation: string): Promise<Pub
       "provider_cursor_invalid",
     );
   }
-  if (errorCode === "ASPSP_TIMEOUT" || response.status === 408) return providerTimeout();
-  if (errorCode === "ASPSP_RATE_LIMIT_EXCEEDED") {
-    return new PublicError(
-      "The bank rate-limited account data access. Do not retry immediately.",
-      "aspsp_rate_limited",
-    );
-  }
-  if (response.status === 429) {
-    return new PublicError(
-      "Enable Banking rate-limited this request. Try again shortly.",
-      "provider_rate_limited",
-    );
-  }
+  if (errorCode === "ASPSP_TIMEOUT" || response.status === 408) return providerTimeout(PROVIDER_LABEL);
+  if (errorCode === "ASPSP_RATE_LIMIT_EXCEEDED") return bankRateLimited();
   if (response.status === 401) {
-    return new PublicError(
-      "Enable Banking rejected the configured credentials.",
-      "provider_auth_failed",
-    );
+    return new PublicError("Enable Banking rejected the configured credentials.", "provider_auth_failed");
   }
-  if (response.status === 403) {
-    return new PublicError(
-      "Enable Banking denied access to this account or service.",
-      "provider_access_denied",
-    );
-  }
-  if (response.status === 404) {
-    return new PublicError(
-      "The configured account or session is unavailable.",
-      "provider_not_found",
-    );
-  }
-  return new PublicError("Enable Banking could not complete this request.", "provider_error");
-}
-
-function applyPsuHeaders(headers: Headers, psuHeaders?: EnableBankingPsuHeaders): void {
-  for (const [name, value] of psuHeaders ?? []) headers.set(name, value);
+  return statusFallbackError(PROVIDER_LABEL, response.status);
 }
 
 function providerOperation(path: string): string {
@@ -599,32 +491,11 @@ function providerOperation(path: string): string {
   return "unknown";
 }
 
-function groupAccountsByInstitution(accounts: AuthorizedAccount[]): AuthorizedAccount[][] {
-  const groups = new Map<string, AuthorizedAccount[]>();
-  for (const account of accounts) {
-    const key = `${account.country}\u0000${account.institution}`;
-    const group = groups.get(key);
-    if (group === undefined) groups.set(key, [account]);
-    else group.push(account);
-  }
-  return [...groups.values()];
-}
-
 function uniqueAccounts(accounts: AuthorizedAccount[]): AuthorizedAccount[] {
-  const seen = new Set<string>();
-  return accounts.filter((account) => {
-    // Only the primary hash is documented for unique matching. Secondary hashes
-    // are fuzzy identifiers. Never guess identity from holder names or balances.
-    if (account.identificationHash === undefined) return true;
-    if (seen.has(account.identificationHash)) return false;
-    seen.add(account.identificationHash);
-    return true;
-  });
+  // Only the primary hash is documented for unique matching. Secondary hashes
+  // are fuzzy identifiers. Never guess identity from holder names or balances.
+  return uniqueBy(accounts, (account) => account.identificationHash);
 }
-
-
-
-
 
 function normalizeTransaction(accountId: string, transaction: EnableBankingTransaction): Transaction {
   const credit = transaction.credit_debit_indicator === "CRDT";

@@ -87,7 +87,9 @@ Each provider is optional. Configure EU banks, UK banks, or both:
 | Provider | Banks | Worker secrets (set all of them, or none) |
 | --- | --- | --- |
 | Enable Banking | EEA banks | `ENABLE_BANKING_APPLICATION_ID`, `ENABLE_BANKING_PRIVATE_KEY_PEM` |
-| TrueLayer | UK banks | `TRUELAYER_CLIENT_ID`, `TRUELAYER_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY` |
+| TrueLayer | UK banks | `TRUELAYER_CLIENT_ID`, `TRUELAYER_CLIENT_SECRET` |
+
+`TOKEN_ENCRYPTION_KEY` is a shared setting, not part of one provider: any provider that stores credentials in KV (today, TrueLayer) refuses to start without it.
 
 The tools and `/setup` show only the configured providers. With none configured, `/setup` lists the secrets to set and the tools answer `setup_required`. A partly configured provider (for example, a client ID without its secret) stops the Worker with `503` so a typo cannot silently disable a provider. For a UK-only deployment, skip the Enable Banking steps below and follow [UK banks through TrueLayer](#4b-optional-uk-banks-through-truelayer).
 
@@ -175,7 +177,7 @@ Enable Banking covers EEA banks only. UK accounts can be added through TrueLayer
    openssl rand -base64 32 | npx wrangler secret put TOKEN_ENCRYPTION_KEY
    ```
 
-   All three must be set together. A `sandbox-` client ID switches the Worker to TrueLayer's sandbox and adds Mock Bank.
+   The client ID and secret must be set together, and TrueLayer will not start without `TOKEN_ENCRYPTION_KEY`. A `sandbox-` client ID switches the Worker to TrueLayer's sandbox and adds Mock Bank.
 
 3. Open `/setup`, choose **Connect a UK bank**, and authorize at the bank. The callback validates `state`, completes a PKCE code exchange with the `offline_access` scope, and stores the encrypted refresh token.
 
@@ -239,4 +241,4 @@ Tests run in the Cloudflare Workers runtime and cover every provider configurati
 
 ## Provider scope
 
-Each provider is one module under `src/providers/<name>/` that implements `BankProvider` (`src/providers/types.ts`): a name, `ownsAccountId`, a request-scoped `reader` for the six tools, and a `setup` part for `/setup` routes and its page section. `src/providers/registry.ts` is the only place that reads provider secrets; `src/aggregate.ts` combines the configured readers and routes account IDs to their owner. Adding a provider means adding a folder and one line in the registry. Future providers should expose the same narrow normalized finance interface rather than leaking generic provider HTTP operations into MCP tools. Contributions must remain read-only from MCP and include tests for identifier validation and response normalization.
+Each provider is one folder under `src/providers/<name>/` that exports a `ProviderModule` (`src/providers/types.ts`): a key, a label, its secret names, and `fromEnv`, which builds a `BankProvider` (`ownsAccountId`, a request-scoped `reader` for the six tools, and a `setup` part for its `/setup` routes and page section). `src/providers/registry.ts` lists the modules and is the only place that reads secrets; `src/aggregate.ts` combines the configured readers and routes account IDs to their owner; `src/providers/shared.ts` holds the HTTP path, error vocabulary, and balance-reading rules every provider must share. Adding a provider means adding a folder and one entry in the registry: tool descriptions, the setup page, and error reporting pick it up from the module. New providers must prefix their account IDs (Enable Banking's bare UUIDs are the one legacy exception) and their KV keys. Future providers should expose the same narrow normalized finance interface rather than leaking generic provider HTTP operations into MCP tools. Contributions must remain read-only from MCP and include tests for identifier validation and response normalization.

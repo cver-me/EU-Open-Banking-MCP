@@ -1,5 +1,6 @@
 // The protected /setup page: a shell that delegates to each configured provider.
 import { escapeHtml, html, methodNotAllowed, redirect } from "./lib/web";
+import { PROVIDER_MODULES } from "./providers/registry";
 import type { BankProvider } from "./providers/types";
 
 const MESSAGES: Record<string, string> = {
@@ -34,7 +35,7 @@ async function setupPage(request: Request, url: URL, providers: readonly BankPro
   // One provider failing to render must not hide the others.
   const sections = await Promise.all(providers.map((provider) =>
     provider.setup.section(request, url).catch(() =>
-      `<h2>${escapeHtml(provider.name)}</h2><p>This provider could not load its connections. Try again shortly.</p>`)));
+      `<h2>${escapeHtml(provider.label)}</h2><p>This provider could not load its connections. Try again shortly.</p>`)));
 
   return `<!doctype html>
 <html lang="en">
@@ -51,6 +52,7 @@ ${sections.length === 0 ? NO_PROVIDERS : sections.join("\n")}
 
 const NO_PROVIDERS = `<p>No bank-data provider is configured. Set the Worker secrets for at least one:</p>
 <ul>
-<li>EU banks (Enable Banking): <code>ENABLE_BANKING_APPLICATION_ID</code> and <code>ENABLE_BANKING_PRIVATE_KEY_PEM</code></li>
-<li>UK banks (TrueLayer): <code>TRUELAYER_CLIENT_ID</code>, <code>TRUELAYER_CLIENT_SECRET</code>, and <code>TOKEN_ENCRYPTION_KEY</code></li>
-</ul>`;
+${PROVIDER_MODULES.map((module) =>
+  `<li>${escapeHtml(module.label)}: ${module.secrets.map((name) => `<code>${escapeHtml(name)}</code>`).join(", ")}</li>`).join("\n")}
+</ul>
+<p>Providers that store credentials, such as TrueLayer, also need <code>TOKEN_ENCRYPTION_KEY</code> (<code>openssl rand -base64 32</code>).</p>`;

@@ -1,7 +1,7 @@
-import { errorMessage, PublicError } from "./errors";
-import type { AccountSummary, ProviderError, ProviderName, TransactionPage } from "./finance";
-import { setupRequired, unknownAccount } from "./providers/shared";
-import type { BalanceReadResult, FinanceReader, TransactionQuery } from "./providers/types";
+import type { AccountSummary, ProviderError, ProviderKey, TransactionPage } from "./finance";
+import type { PsuContext } from "./lib/psu";
+import { isSetupRequired, publicErrorFields, setupRequired, unknownAccount } from "./providers/shared";
+import type { BalanceReadResult, BankProvider, FinanceReader, TransactionQuery } from "./providers/types";
 
 /** Results from every configured provider, plus the providers that could not be read. */
 export interface ProviderResult<T> {
@@ -9,16 +9,8 @@ export interface ProviderResult<T> {
   providerErrors: ProviderError[];
 }
 
-/** The reads the MCP tools use. All-account reads tolerate one provider failing. */
-export interface AggregateFinanceProvider {
-  listAccounts(): Promise<ProviderResult<AccountSummary[]>>;
-  listAccountIds(): Promise<ProviderResult<string[]>>;
-  getBalances(accountId?: string): Promise<ProviderResult<BalanceReadResult>>;
-  listTransactions(accountId: string, query: TransactionQuery): Promise<TransactionPage>;
-}
-
-export interface NamedReader {
-  name: ProviderName;
+interface ConfiguredReader {
+  name: ProviderKey;
   ownsAccountId(accountId: string): boolean;
   reader: FinanceReader;
 }
@@ -27,8 +19,17 @@ export interface NamedReader {
  * Presents every configured provider's accounts as one account list. Works with any
  * number of providers, including none (every read then reports setup_required).
  */
-export class Aggregate implements AggregateFinanceProvider {
-  constructor(private readonly providers: readonly NamedReader[]) {}
+export class Aggregate {
+  private readonly providers: readonly ConfiguredReader[];
+
+  /** Request-scoped: readers share token work within one request only. */
+  constructor(providers: readonly BankProvider[], psu: PsuContext) {
+    this.providers = providers.map((provider) => ({
+      name: provider.name,
+      ownsAccountId: provider.ownsAccountId,
+      reader: provider.reader(psu),
+    }));
+  }
 
   async listAccounts(): Promise<ProviderResult<AccountSummary[]>> {
     const { values, providerErrors } = await this.fromAll((reader) => reader.listAccounts());
@@ -80,13 +81,9 @@ export class Aggregate implements AggregateFinanceProvider {
     settled.forEach((result, index) => {
       if (result.status === "fulfilled") {
         values.push(result.value);
-      } else if (!(result.reason instanceof PublicError && result.reason.code === "setup_required")) {
+      } else if (!isSetupRequired(result.reason)) {
         firstFailure ??= result.reason;
-        providerErrors.push({
-          provider: this.providers[index]!.name,
-          code: result.reason instanceof PublicError ? result.reason.code : "provider_error",
-          message: errorMessage(result.reason),
-        });
+        providerErrors.push({ provider: this.providers[index]!.name, ...publicErrorFields(result.reason) });
       }
     });
 

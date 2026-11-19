@@ -40,21 +40,13 @@ export default {
       return withSecurityHeaders(Response.json({ error: "service_unavailable" }, { status: 503 }));
     }
 
-    const setupResponse = await handleSetupRequest(request, providers);
-    if (setupResponse !== undefined) return withSecurityHeaders(setupResponse);
-
     if (new URL(request.url).pathname !== "/mcp") {
-      return withSecurityHeaders(Response.json({ error: "not_found" }, { status: 404 }));
+      const setupResponse = await handleSetupRequest(request, providers);
+      return withSecurityHeaders(setupResponse ?? Response.json({ error: "not_found" }, { status: 404 }));
     }
 
     const psu = psuContextFromRequest(request);
-    const handler = createMcpHandler(() =>
-      // Readers are request-scoped: they share token work within one request only.
-      createFinanceServer(new Aggregate(providers.map((provider) => ({
-        name: provider.name,
-        ownsAccountId: provider.ownsAccountId,
-        reader: provider.reader(psu),
-      })))), {
+    const handler = createMcpHandler(() => createFinanceServer(new Aggregate(providers, psu)), {
       route: "/mcp",
       corsOptions: false,
       legacy: "stateless",

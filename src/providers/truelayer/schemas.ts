@@ -17,8 +17,6 @@ export const tokenResponseSchema = z.object({
   access_token: z.string().min(1).max(16_384),
   expires_in: z.number().int().positive().max(86_400),
   refresh_token: z.string().min(1).max(8_192).optional(),
-  token_type: z.string().max(50).optional(),
-  scope: z.string().max(1_000).optional(),
 });
 
 export const errorResponseSchema = z.object({
@@ -115,7 +113,6 @@ export const transactionsSchema = z.object({
   results: z
     .array(
       z.object({
-        transaction_id: text(200),
         timestamp: z.string().regex(/^\d{4}-\d{2}-\d{2}/).max(100),
         description: nullableOptional(text(1_000)),
         amount: finiteNumber,

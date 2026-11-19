@@ -19,7 +19,6 @@ let config: EnableBankingConfig;
 const trueLayerConfig: TrueLayerConfig = {
   clientId: "personalfinance-abc123",
   clientSecret: "test-client-secret",
-  tokenEncryptionKey: new Uint8Array(32),
   sandbox: false,
 };
 
@@ -34,12 +33,12 @@ beforeAll(async () => {
 // Real setup adapters over injected stores; reads are not exercised here.
 function enableBanking(sessions: SessionStore): BankProvider {
   const client = new EnableBankingClient(config, sessions);
-  return { name: "enable_banking", ownsAccountId: () => false, reader: () => client, setup: new EnableBankingSetup(client) };
+  return { name: "enable_banking", label: "EU banks (Enable Banking)", ownsAccountId: () => false, reader: () => client, setup: new EnableBankingSetup(client) };
 }
 
 function trueLayer(store: TrueLayerConnectionStore): BankProvider {
   const client = new TrueLayerClient(trueLayerConfig, store);
-  return { name: "truelayer", ownsAccountId: () => false, reader: () => client, setup: new TrueLayerSetup(trueLayerConfig, client) };
+  return { name: "truelayer", label: "UK banks (TrueLayer)", ownsAccountId: () => false, reader: () => client, setup: new TrueLayerSetup(trueLayerConfig, client) };
 }
 
 describe("protected setup flow", () => {

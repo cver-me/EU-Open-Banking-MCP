@@ -176,11 +176,12 @@ export interface TransactionPage {
   historyUnavailable?: boolean;
 }
 
-export const providerNameSchema = z.enum(["enable_banking", "truelayer"]);
-export type ProviderName = z.infer<typeof providerNameSchema>;
+// Provider keys come from the provider modules; shared schemas don't list them.
+export const providerKeySchema = z.string().regex(/^[a-z][a-z0-9_]{0,39}$/);
+export type ProviderKey = z.infer<typeof providerKeySchema>;
 
 export const providerErrorSchema = z.object({
-  provider: providerNameSchema.describe("Data provider that could not be read: enable_banking (EU banks) or truelayer (UK banks)"),
+  provider: providerKeySchema.describe("Key of the data provider that could not be read; its accounts are missing from the result"),
   code: z.string().min(1).max(100).describe("Stable machine-readable failure code"),
   message: z.string().min(1).max(500).describe("Safe explanation without provider payloads"),
 });

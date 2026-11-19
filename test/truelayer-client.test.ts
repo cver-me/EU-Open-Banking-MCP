@@ -16,7 +16,6 @@ const CONNECTION_ID = "66666666-6666-4666-8666-666666666666";
 const config: TrueLayerConfig = {
   clientId: "personalfinance-abc123",
   clientSecret: "test-client-secret",
-  tokenEncryptionKey: decodeEncryptionKey(KEY_BASE64),
   sandbox: false,
 };
 

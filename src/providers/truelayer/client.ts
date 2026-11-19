@@ -1,26 +1,32 @@
 import type { z } from "zod";
 import { PublicError } from "../../errors";
-import type {
-  AccountReadError,
-  AccountSummary,
-  Balance,
-  CashAccountType,
-  Transaction,
-  TransactionPage,
+import {
+  isoDateSchema,
+  type AccountSummary,
+  type Balance,
+  type BalanceType,
+  type CashAccountType,
+  type Transaction,
+  type TransactionPage,
 } from "../../finance";
-import { readBoundedJson } from "../../lib/http";
 import { addDays, laterDate, todayIsoDate } from "../../lib/dates";
 import { Money } from "../../lib/money";
+import type { PsuContext } from "../../lib/psu";
 import {
-  accountReadError,
-  isBankRateLimit,
+  bankRateLimited,
+  groupBy,
   optionalText,
   parseProviderResponse as sharedParseProviderResponse,
-  providerTimeout as sharedProviderTimeout,
+  providerFetch,
+  providerTimeout,
+  readGroupedBalances,
+  readProviderErrorCode,
   setupRequired,
+  statusFallbackError,
+  uniqueBy,
   unknownAccount,
 } from "../shared";
-import type { BalanceReadResult, FinanceReader, PsuContext, TransactionQuery } from "../types";
+import type { BalanceReadResult, FinanceReader, TransactionQuery } from "../types";
 import type { TrueLayerConfig } from "./config";
 import {
   MAX_TRUELAYER_CONNECTIONS,
@@ -42,7 +48,6 @@ import {
 } from "./schemas";
 
 const PROVIDER_LABEL = "TrueLayer";
-const REQUEST_TIMEOUT_MS = 10_000;
 const ACCESS_TOKEN_SAFETY_MARGIN_MS = 60_000;
 const DEFAULT_HISTORY_DAYS = 90;
 // TrueLayer returns a whole date range in one response. Quarter-year windows keep
@@ -53,8 +58,10 @@ const TRANSACTION_WINDOW_DAYS = 92;
 const MAX_TRUELAYER_RESPONSE_BYTES = 4_000_000;
 const CONTINUATION_PREFIX = "tl1:";
 
-export const TRUELAYER_SCOPES = "accounts balance cards transactions offline_access";
+const TRUELAYER_SCOPES = "accounts balance cards transactions offline_access";
 const TRUELAYER_PROVIDERS = "uk-ob-all uk-oauth-all";
+// Only UK providers are requested, so every account is in GB.
+const COUNTRY = "GB" as const;
 
 type AccountKind = "accounts" | "cards";
 
@@ -64,6 +71,7 @@ interface AuthorizedAccount {
   kind: AccountKind;
   connectionId: string;
   institution: string;
+  country: string;
   currency: string;
   accountType?: string;
   displayName?: string;
@@ -78,7 +86,6 @@ export interface TrueLayerConnectionSummary {
   consentExpiresAt?: string;
   createdAt: string;
 }
-
 
 export function trueLayerAuthorizationUrl(
   config: TrueLayerConfig,
@@ -115,7 +122,7 @@ export class TrueLayerClient implements FinanceReader {
     return (await this.listedAccounts()).map((account) => ({
       accountId: account.accountId,
       institution: account.institution,
-      country: "GB",
+      country: account.country,
       currency: account.currency,
       cashAccountType: cashAccountType(account),
       ...(account.displayName === undefined ? {} : { product: account.displayName }),
@@ -134,33 +141,11 @@ export class TrueLayerClient implements FinanceReader {
       return { balances: await this.accountBalances(await this.selectAccount(accountId)), errors: [] };
     }
 
-    const byConnection = new Map<string, AuthorizedAccount[]>();
-    for (const account of await this.listedAccounts()) {
-      byConnection.set(account.connectionId, [...(byConnection.get(account.connectionId) ?? []), account]);
-    }
-    const results = await Promise.all(
-      [...byConnection.values()].map(async (group) => {
-        const balances: Balance[] = [];
-        const errors: AccountReadError[] = [];
-        for (const [index, account] of group.entries()) {
-          try {
-            balances.push(...(await this.accountBalances(account)));
-          } catch (error) {
-            errors.push(accountReadError({ ...account, country: "GB" }, error));
-            if (isBankRateLimit(error)) {
-              // Further reads at the same bank would hit the same limit.
-              for (const skipped of group.slice(index + 1)) errors.push(accountReadError({ ...skipped, country: "GB" }, error));
-              break;
-            }
-          }
-        }
-        return { balances, errors };
-      }),
+    // One connection is one bank login: a rate limit there applies to all its accounts.
+    return readGroupedBalances(
+      groupBy(await this.listedAccounts(), (account) => account.connectionId),
+      (account) => this.accountBalances(account),
     );
-    return {
-      balances: results.flatMap((result) => result.balances),
-      errors: results.flatMap((result) => result.errors),
-    };
   }
 
   async listTransactions(accountId: string, query: TransactionQuery): Promise<TransactionPage> {
@@ -175,7 +160,6 @@ export class TrueLayerClient implements FinanceReader {
       ? dateTo
       : parseContinuationKey(query.continuationKey, dateFrom, dateTo);
     const windowFrom = laterDate(dateFrom, addDays(windowTo, -(TRANSACTION_WINDOW_DAYS - 1)));
-    const firstPage = query.continuationKey === undefined;
 
     let historyUnavailable = false;
     const [settled, pending] = await Promise.all([
@@ -191,7 +175,7 @@ export class TrueLayerClient implements FinanceReader {
           })
         : Promise.resolve([]),
       // Pending entries are recent; read them once, on the first page, over the whole range.
-      includePending && firstPage
+      includePending && query.continuationKey === undefined
         ? this.readTransactions(account, "/pending", dateFrom, dateTo).catch((error: unknown) => {
             if (error instanceof PublicError && error.code === "provider_unsupported") return [];
             throw error;
@@ -244,7 +228,7 @@ export class TrueLayerClient implements FinanceReader {
 
     let metadata: z.infer<typeof meSchema>["results"][number] | undefined;
     try {
-      metadata = meSchema.parse(await this.dataRequest(token.access_token, "/me")).results[0];
+      metadata = meSchema.parse(await this.dataRequest(token.access_token, "/me", "get_connection_metadata")).results[0];
     } catch {
       // Labels are optional; the connection is usable without them.
     }
@@ -270,7 +254,7 @@ export class TrueLayerClient implements FinanceReader {
     }
     try {
       const accessToken = await this.accessToken(connection);
-      await this.fetchJson(`${origins(this.config).auth}/api/delete`, {
+      await this.fetch(`${origins(this.config).auth}/api/delete`, {
         method: "DELETE",
         accessToken,
         operation: "delete_credential",
@@ -302,13 +286,7 @@ export class TrueLayerClient implements FinanceReader {
    * duplicate's ID still works when requested explicitly.
    */
   private async listedAccounts(): Promise<AuthorizedAccount[]> {
-    const seen = new Set<string>();
-    return (await this.authorizedAccounts()).filter((account) => {
-      if (account.identity === undefined) return true;
-      if (seen.has(account.identity)) return false;
-      seen.add(account.identity);
-      return true;
-    });
+    return uniqueBy(await this.authorizedAccounts(), (account) => account.identity);
   }
 
   private authorizedAccounts(): Promise<AuthorizedAccount[]> {
@@ -349,43 +327,48 @@ export class TrueLayerClient implements FinanceReader {
 
   private async discoverAccounts(connection: TrueLayerConnection): Promise<AuthorizedAccount[]> {
     const [accounts, cards] = await Promise.all([
-      this.connectionRequest(connection, "/accounts").then((value) =>
-        parseProviderResponse(accountsSchema, value, "get_accounts").results),
-      this.connectionRequest(connection, "/cards")
-        .then((value) => parseProviderResponse(cardsSchema, value, "get_cards").results)
+      this.connectionRequest(connection, "/accounts", "get_accounts")
+        .then((value) => parseProviderResponse(accountsSchema, value, "get_accounts", "account").results),
+      this.connectionRequest(connection, "/cards", "get_cards")
+        .then((value) => parseProviderResponse(cardsSchema, value, "get_cards", "card").results)
         .catch((error: unknown) => {
           // Many banks expose no card endpoint, and the scope may not be granted.
           if (error instanceof PublicError && error.code !== "provider_reauthorization_required") return [];
           throw error;
         }),
     ]);
-    const fallbackName = (provider: { display_name?: string | undefined; provider_id?: string | undefined } | null | undefined) =>
-      connection.record.providerName ?? provider?.display_name ?? provider?.provider_id ?? "TrueLayer bank";
+    const common = (providerAccountId: string, provider: { display_name?: string | undefined; provider_id?: string | undefined } | null | undefined) => ({
+      providerAccountId,
+      connectionId: connection.id,
+      institution: connection.record.providerName ?? provider?.display_name ?? provider?.provider_id ?? "TrueLayer bank",
+      country: COUNTRY,
+    });
 
     return [
-      ...accounts.map((account) => ({
-        accountId: `tl-a-${account.account_id}`,
-        providerAccountId: account.account_id,
-        kind: "accounts" as const,
-        connectionId: connection.id,
-        institution: fallbackName(account.provider),
-        currency: account.currency,
-        ...(account.account_type === undefined ? {} : { accountType: account.account_type }),
-        ...(accountIdentity(account) === undefined ? {} : { identity: accountIdentity(account)! }),
-        ...(optionalText(account.display_name) === undefined ? {} : { displayName: optionalText(account.display_name)! }),
-      })),
-      ...cards.map((card) => {
+      ...accounts.map((account): AuthorizedAccount => {
+        const displayName = optionalText(account.display_name);
+        const identity = accountIdentity(account);
+        return {
+          ...common(account.account_id, account.provider),
+          accountId: `tl-a-${account.account_id}`,
+          kind: "accounts",
+          currency: account.currency,
+          ...(account.account_type === undefined ? {} : { accountType: account.account_type }),
+          ...(displayName === undefined ? {} : { displayName }),
+          ...(identity === undefined ? {} : { identity }),
+        };
+      }),
+      ...cards.map((card): AuthorizedAccount => {
         const displayName = optionalText(card.display_name) ??
           optionalText([card.card_network, card.card_type].filter(Boolean).join(" "));
+        const identity = cardIdentity(card);
         return {
+          ...common(card.account_id, card.provider),
           accountId: `tl-c-${card.account_id}`,
-          providerAccountId: card.account_id,
-          kind: "cards" as const,
-          connectionId: connection.id,
-          institution: fallbackName(card.provider),
+          kind: "cards",
           currency: card.currency,
           ...(displayName === undefined ? {} : { displayName }),
-          ...(cardIdentity(card) === undefined ? {} : { identity: cardIdentity(card)! }),
+          ...(identity === undefined ? {} : { identity }),
         };
       }),
     ];
@@ -394,44 +377,39 @@ export class TrueLayerClient implements FinanceReader {
   private async accountBalances(account: AuthorizedAccount): Promise<Balance[]> {
     const connection = await this.connectionFor(account);
     const path = `/${account.kind}/${encodeURIComponent(account.providerAccountId)}/balance`;
-    const base = { accountId: account.accountId, institution: account.institution, country: "GB" };
-
-    if (account.kind === "cards") {
-      const results = parseProviderResponse(
-        cardBalanceSchema, await this.connectionRequest(connection, path), "get_card_balance",
-      ).results;
-      return results.flatMap((balance) => [
-        { ...base, currency: balance.currency, amount: decimal(balance.current), balanceType: "interim_booked" as const, label: "card current balance (as reported by the card issuer)" },
-        ...(balance.available === undefined ? [] : [
-          { ...base, currency: balance.currency, amount: decimal(balance.available), balanceType: "interim_available" as const, label: "available credit" },
-        ]),
-        ...(balance.credit_limit === undefined ? [] : [
-          { ...base, currency: balance.currency, amount: decimal(balance.credit_limit), balanceType: "informational" as const, label: "credit limit" },
-        ]),
-        ...(balance.last_statement_balance === undefined ? [] : [{
-          ...base,
+    // TrueLayer flattens each bank's balances into a few fields; each becomes one labelled measurement.
+    const rows = account.kind === "cards"
+      ? parseProviderResponse(cardBalanceSchema, await this.connectionRequest(connection, path, "get_card_balance"), "get_card_balance", "balance")
+        .results.map((balance) => ({
           currency: balance.currency,
-          amount: decimal(balance.last_statement_balance),
-          balanceType: "closing_booked" as const,
-          label: "last statement balance",
-          ...(isoDatePrefix(balance.last_statement_date) === undefined
-            ? {} : { referenceDate: isoDatePrefix(balance.last_statement_date)! }),
-        }]),
-      ]);
-    }
+          entries: [
+            [balance.current, "interim_booked", "card current balance (as reported by the card issuer)"],
+            [balance.available, "interim_available", "available credit"],
+            [balance.credit_limit, "informational", "credit limit"],
+            [balance.last_statement_balance, "closing_booked", "last statement balance", isoDatePrefix(balance.last_statement_date)],
+          ] as const,
+        }))
+      : parseProviderResponse(accountBalanceSchema, await this.connectionRequest(connection, path, "get_account_balance"), "get_account_balance", "balance")
+        .results.map((balance) => ({
+          currency: balance.currency,
+          entries: [
+            [balance.current, "interim_booked", "current balance (booked)"],
+            [balance.available, "interim_available", "available balance (includes any arranged overdraft)"],
+            [balance.overdraft, "informational", "arranged overdraft limit"],
+          ] as const,
+        }));
 
-    const results = parseProviderResponse(
-      accountBalanceSchema, await this.connectionRequest(connection, path), "get_account_balance",
-    ).results;
-    return results.flatMap((balance) => [
-      { ...base, currency: balance.currency, amount: decimal(balance.current), balanceType: "interim_booked" as const, label: "current balance (booked)" },
-      ...(balance.available === undefined ? [] : [
-        { ...base, currency: balance.currency, amount: decimal(balance.available), balanceType: "interim_available" as const, label: "available balance (includes any arranged overdraft)" },
-      ]),
-      ...(balance.overdraft === undefined ? [] : [
-        { ...base, currency: balance.currency, amount: decimal(balance.overdraft), balanceType: "informational" as const, label: "arranged overdraft limit" },
-      ]),
-    ]);
+    return rows.flatMap(({ currency, entries }) => entries.flatMap(([amount, balanceType, label, referenceDate]: readonly [number | undefined, BalanceType, string, (string | undefined)?]) =>
+      amount === undefined ? [] : [{
+        accountId: account.accountId,
+        institution: account.institution,
+        country: account.country,
+        currency,
+        amount: decimal(amount),
+        balanceType,
+        label,
+        ...(referenceDate === undefined ? {} : { referenceDate }),
+      }]));
   }
 
   private async readTransactions(
@@ -442,15 +420,13 @@ export class TrueLayerClient implements FinanceReader {
   ): Promise<TrueLayerTransaction[]> {
     const connection = await this.connectionFor(account);
     const params = new URLSearchParams({ from, to });
+    const operation = suffix === "" ? "get_transactions" : "get_pending_transactions";
     const value = await this.connectionRequest(
       connection,
       `/${account.kind}/${encodeURIComponent(account.providerAccountId)}/transactions${suffix}?${params.toString()}`,
+      operation,
     );
-    return parseProviderResponse(
-      transactionsSchema,
-      value,
-      suffix === "" ? "get_transactions" : "get_pending_transactions",
-    ).results;
+    return parseProviderResponse(transactionsSchema, value, operation, "transaction").results;
   }
 
   private async connectionFor(account: AuthorizedAccount): Promise<TrueLayerConnection> {
@@ -460,13 +436,13 @@ export class TrueLayerClient implements FinanceReader {
   }
 
   /** Data API request with one forced token refresh if the cached access token was rejected. */
-  private async connectionRequest(connection: TrueLayerConnection, path: string): Promise<unknown> {
+  private async connectionRequest(connection: TrueLayerConnection, path: string, operation: string): Promise<unknown> {
     try {
-      return await this.dataRequest(await this.accessToken(connection), path);
+      return await this.dataRequest(await this.accessToken(connection), path, operation);
     } catch (error) {
       if (!(error instanceof PublicError) || error.code !== "provider_token_rejected") throw error;
       this.accessTokens.delete(connection.id);
-      return this.dataRequest(await this.accessToken(connection, true), path);
+      return this.dataRequest(await this.accessToken(connection, true), path, operation);
     }
   }
 
@@ -512,71 +488,38 @@ export class TrueLayerClient implements FinanceReader {
   }
 
   private async tokenRequest(body: Record<string, string>): Promise<z.infer<typeof tokenResponseSchema>> {
-    const value = await this.fetchJson(`${origins(this.config).auth}/connect/token`, {
+    const operation = body.grant_type === "refresh_token" ? "refresh_token" : "exchange_code";
+    const value = await this.fetch(`${origins(this.config).auth}/connect/token`, {
       method: "POST",
-      body: JSON.stringify({
-        client_id: this.config.clientId,
-        client_secret: this.config.clientSecret,
-        ...body,
-      }),
-      operation: body.grant_type === "refresh_token" ? "refresh_token" : "exchange_code",
+      body: JSON.stringify({ client_id: this.config.clientId, client_secret: this.config.clientSecret, ...body }),
+      operation,
     });
-    const parsed = tokenResponseSchema.safeParse(value);
-    if (!parsed.success) {
-      throw new PublicError("TrueLayer returned an invalid token response.", "provider_response_invalid");
-    }
-    return parsed.data;
+    return parseProviderResponse(tokenResponseSchema, value, operation, "token");
   }
 
-  private dataRequest(accessToken: string, path: string): Promise<unknown> {
-    return this.fetchJson(`${origins(this.config).api}${path}`, {
-      method: "GET",
-      accessToken,
-      includePsu: true,
-      operation: dataOperation(path),
-    });
+  private dataRequest(accessToken: string, path: string, operation: string): Promise<unknown> {
+    // TrueLayer forwards only the user's IP address to the bank.
+    const headers = this.psu?.ipAddress === undefined ? undefined : new Headers({ "X-PSU-IP": this.psu.ipAddress });
+    return this.fetch(`${origins(this.config).api}${path}`, { method: "GET", accessToken, operation, ...(headers === undefined ? {} : { headers }) });
   }
 
-  private async fetchJson(
+  private fetch(
     url: string,
-    init: {
-      method: "DELETE" | "GET" | "POST";
-      operation: string;
-      accessToken?: string;
-      body?: string;
-      includePsu?: boolean;
-    },
+    init: { method: "DELETE" | "GET" | "POST"; operation: string; accessToken?: string; body?: string; headers?: Headers },
   ): Promise<unknown> {
-    const headers = new Headers({ Accept: "application/json" });
+    const headers = new Headers(init.headers);
     if (init.accessToken !== undefined) headers.set("Authorization", `Bearer ${init.accessToken}`);
-    if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    if (init.includePsu && this.psu?.ipAddress !== undefined) headers.set("X-PSU-IP", this.psu.ipAddress);
-
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: init.method,
-        headers,
-        ...(init.body === undefined ? {} : { body: init.body }),
-        redirect: "manual",
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "TimeoutError") throw providerTimeout();
-      console.error(JSON.stringify({
-        message: "TrueLayer fetch threw",
-        operation: init.operation,
-        errorType: error instanceof Error ? error.name : typeof error,
-      }));
-      throw error;
-    }
-
-    if (response.status >= 300 && response.status < 400) {
-      throw new PublicError("TrueLayer returned an unexpected redirect.", "provider_redirect_rejected");
-    }
-    if (!response.ok) throw await providerError(response, init.operation);
-    if (init.method === "DELETE") return null;
-    return readBoundedJson(response, MAX_TRUELAYER_RESPONSE_BYTES);
+    return providerFetch({
+      url,
+      method: init.method,
+      headers,
+      ...(init.body === undefined ? {} : { body: init.body }),
+      providerLabel: PROVIDER_LABEL,
+      operation: init.operation,
+      maxBytes: MAX_TRUELAYER_RESPONSE_BYTES,
+      parseBody: init.method !== "DELETE",
+      toError: (response) => providerError(response, init.operation),
+    });
   }
 }
 
@@ -586,39 +529,12 @@ function origins(config: TrueLayerConfig): { auth: string; api: string } {
     : { auth: "https://auth.truelayer.com", api: "https://api.truelayer.com/data/v1" };
 }
 
-function dataOperation(path: string): string {
-  if (path === "/me") return "get_connection_metadata";
-  if (path === "/accounts") return "get_accounts";
-  if (path === "/cards") return "get_cards";
-  if (/\/balance$/.test(path)) return "get_balance";
-  if (/\/transactions\/pending\?/.test(path)) return "get_pending_transactions";
-  if (/\/transactions\?/.test(path)) return "get_transactions";
-  return "unknown";
-}
-
-function parseProviderResponse<T extends z.ZodType>(schema: T, value: unknown, operation: string): z.output<T> {
-  return sharedParseProviderResponse(schema, value, { providerLabel: PROVIDER_LABEL, operation, dataKind: "account" });
-}
-
-function providerTimeout(): PublicError {
-  return sharedProviderTimeout(PROVIDER_LABEL);
+function parseProviderResponse<T extends z.ZodType>(schema: T, value: unknown, operation: string, dataKind: string): z.output<T> {
+  return sharedParseProviderResponse(schema, value, { providerLabel: PROVIDER_LABEL, operation, dataKind });
 }
 
 async function providerError(response: Response, operation: string): Promise<PublicError> {
-  let errorCode: string | undefined;
-  try {
-    const parsed = errorResponseSchema.safeParse(await readBoundedJson(response));
-    if (parsed.success) errorCode = parsed.data.error;
-  } catch {
-    // Fall back to status-based handling.
-  }
-  console.warn(JSON.stringify({
-    message: "TrueLayer request failed",
-    operation,
-    status: response.status,
-    errorCode: errorCode ?? "unknown",
-  }));
-
+  const errorCode = await readProviderErrorCode(response, errorResponseSchema, { providerLabel: PROVIDER_LABEL, operation });
   if (errorCode === "sca_exceeded") {
     return new PublicError(
       "The bank only shares older transaction history shortly after connecting (usually up to 90 days afterwards). Use a more recent date range, or reconnect the bank at /setup.",
@@ -641,27 +557,16 @@ async function providerError(response: Response, operation: string): Promise<Pub
     return new PublicError("The bank authorization code expired. Start again.", "authorization_code_invalid");
   }
   if (errorCode === "provider_too_many_requests" || errorCode === "provider_request_limit_exceeded") {
-    return new PublicError(
-      "The bank rate-limited account data access. Do not retry immediately.",
-      "aspsp_rate_limited",
-    );
-  }
-  if (response.status === 429) {
-    return new PublicError("TrueLayer rate-limited this request. Try again shortly.", "provider_rate_limited");
+    return bankRateLimited();
   }
   if (response.status === 501 || errorCode === "endpoint_not_supported") {
     return new PublicError("This bank does not support the requested data through TrueLayer.", "provider_unsupported");
   }
   if (response.status === 504 || errorCode === "provider_timeout" || errorCode === "connector_timeout") {
-    return providerTimeout();
+    return providerTimeout(PROVIDER_LABEL);
   }
-  if (response.status === 404 || errorCode === "account_not_found") {
-    return new PublicError("The configured account or connection is unavailable.", "provider_not_found");
-  }
-  if (response.status === 403) {
-    return new PublicError("TrueLayer denied access to this account or service.", "provider_access_denied");
-  }
-  return new PublicError("TrueLayer could not complete this request.", "provider_error");
+  if (errorCode === "account_not_found") return statusFallbackError(PROVIDER_LABEL, 404);
+  return statusFallbackError(PROVIDER_LABEL, response.status);
 }
 
 function normalizeTransaction(
@@ -757,7 +662,7 @@ function cashAccountType(account: AuthorizedAccount): CashAccountType {
 
 function parseContinuationKey(key: string, dateFrom: string, dateTo: string): string {
   const date = key.startsWith(CONTINUATION_PREFIX) ? key.slice(CONTINUATION_PREFIX.length) : "";
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < dateFrom || date > dateTo) {
+  if (!isoDateSchema.safeParse(date).success || date < dateFrom || date > dateTo) {
     throw new PublicError(
       "The TrueLayer pagination cursor is no longer valid. Start the query again.",
       "provider_cursor_invalid",
@@ -766,19 +671,12 @@ function parseContinuationKey(key: string, dateFrom: string, dateTo: string): st
   return date;
 }
 
-
 function decimal(value: number): string {
   return new Money(value).toFixed();
 }
 
 function isoDatePrefix(value: string | undefined): string | undefined {
   const date = value?.slice(0, 10);
-  return date !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined;
+  return isoDateSchema.safeParse(date).success ? date : undefined;
 }
-
-
-
-
-
-
 

@@ -1,17 +1,15 @@
 import { z } from "zod";
-import { errorMessage, PublicError } from "../../errors";
 import {
   authorizationPage,
   callbackCookie,
-  errorPage,
   escapeHtml,
   html,
   methodNotAllowed,
-  readCookie,
+  readAuthorizationCallback,
   readForm,
   redirect,
   requireSameOrigin,
-  tokensMatch,
+  setupErrorResponse,
 } from "../../lib/web";
 import type { ProviderSetup } from "../types";
 import type { EnableBankingClient } from "./client";
@@ -34,6 +32,7 @@ export class EnableBankingSetup implements ProviderSetup {
 
   async handle(request: Request, url: URL): Promise<Response | undefined> {
     if (![CONNECT_PATH, REMOVE_PATH, CALLBACK_PATH].includes(url.pathname)) return undefined;
+    const clearCookie = callbackCookie(STATE_COOKIE, CALLBACK_PATH, undefined);
     try {
       if (url.pathname === CONNECT_PATH) {
         if (request.method !== "POST") return methodNotAllowed();
@@ -52,19 +51,11 @@ export class EnableBankingSetup implements ProviderSetup {
       }
       // Callback
       if (request.method !== "GET") return methodNotAllowed();
-      if (url.searchParams.has("error")) {
-        throw new PublicError("Bank authorization was cancelled or denied.", "authorization_denied");
-      }
-      const code = z.string().min(1).max(4_096).parse(url.searchParams.get("code"));
-      const state = z.uuid().parse(url.searchParams.get("state"));
-      const cookieState = z.uuid().parse(readCookie(request, STATE_COOKIE));
-      if (!(await tokensMatch(state, cookieState))) {
-        throw new PublicError("The authorization state did not match. Start again.", "invalid_state");
-      }
+      const { code } = await readAuthorizationCallback(request, url, STATE_COOKIE);
       await this.client.completeAuthorization(code);
-      return redirect("/setup?connected=1", callbackCookie(STATE_COOKIE, CALLBACK_PATH, undefined));
+      return redirect("/setup?connected=1", clearCookie);
     } catch (error) {
-      return html(errorPage(errorMessage(error)), 400, callbackCookie(STATE_COOKIE, CALLBACK_PATH, undefined));
+      return setupErrorResponse(error, clearCookie);
     }
   }
 

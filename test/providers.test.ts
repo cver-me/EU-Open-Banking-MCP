@@ -1,9 +1,9 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { Aggregate, type NamedReader } from "../src/aggregate";
+import { Aggregate } from "../src/aggregate";
 import { PublicError } from "../src/errors";
 import { configuredProviders, type ProviderEnv } from "../src/providers/registry";
-import type { FinanceReader } from "../src/providers/types";
+import type { BankProvider, FinanceReader } from "../src/providers/types";
 
 const KEY_BASE64 = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
 const EU = {
@@ -28,6 +28,8 @@ describe("configuredProviders", () => {
     ["both", { ...EU, ...UK }, ["enable_banking", "truelayer"]],
     // Empty strings are how an unset secret can appear in local .dev.vars files.
     ["empty values", { ENABLE_BANKING_APPLICATION_ID: "", TRUELAYER_CLIENT_ID: "" }, []],
+    // The encryption key is a shared setting, not part of any one provider.
+    ["only TOKEN_ENCRYPTION_KEY", { TOKEN_ENCRYPTION_KEY: KEY_BASE64 }, []],
   ])("enables providers for %s", (_label, vars, expected) => {
     expect(providerNames(vars)).toEqual(expected);
   });
@@ -36,6 +38,7 @@ describe("configuredProviders", () => {
     ["Enable Banking", { ENABLE_BANKING_APPLICATION_ID: EU.ENABLE_BANKING_APPLICATION_ID }],
     ["TrueLayer", { TRUELAYER_CLIENT_ID: "abc" }],
     ["TrueLayer with a short key", { ...UK, TOKEN_ENCRYPTION_KEY: btoa("short") }],
+    ["TrueLayer without TOKEN_ENCRYPTION_KEY", { TRUELAYER_CLIENT_ID: "abc", TRUELAYER_CLIENT_SECRET: "secret" }],
   ])("rejects a partial or invalid %s configuration", (_label, vars) => {
     expect(() => providerNames(vars)).toThrow();
   });
@@ -57,32 +60,37 @@ describe("Aggregate", () => {
     listAccountIds: vi.fn(async () => []),
     ...overrides,
   });
-  const eu = (overrides?: Partial<FinanceReader>): NamedReader => ({
-    name: "enable_banking", ownsAccountId: (id) => !id.startsWith("tl-"), reader: reader(overrides),
-  });
-  const uk = (overrides?: Partial<FinanceReader>): NamedReader => ({
-    name: "truelayer", ownsAccountId: (id) => id.startsWith("tl-"), reader: reader(overrides),
-  });
+  const fake = (name: string, owns: (id: string) => boolean, overrides?: Partial<FinanceReader>) => {
+    const instance = reader(overrides);
+    const provider: BankProvider = {
+      name, label: name, ownsAccountId: owns, reader: () => instance,
+      setup: { handle: async () => undefined, section: async () => "" },
+    };
+    return Object.assign(provider, { instance });
+  };
+  const eu = (overrides?: Partial<FinanceReader>) => fake("enable_banking", (id) => !id.startsWith("tl-"), overrides);
+  const uk = (overrides?: Partial<FinanceReader>) => fake("truelayer", (id) => id.startsWith("tl-"), overrides);
+  const combine = (...providers: BankProvider[]) => new Aggregate(providers, {});
   const setupRequired = () => Promise.reject(new PublicError("setup", "setup_required"));
   const timeout = (label: string) => () => Promise.reject(new PublicError(`${label} timed out.`, "provider_timeout"));
 
   it("requires setup when no provider is configured", async () => {
-    await expect(new Aggregate([]).listAccountIds()).rejects.toMatchObject({ code: "setup_required" });
-    expect(() => new Aggregate([]).listTransactions("tl-a-x", {})).toThrow(expect.objectContaining({ code: "unknown_account" }));
+    await expect(combine().listAccountIds()).rejects.toMatchObject({ code: "setup_required" });
+    expect(() => combine().listTransactions("tl-a-x", {})).toThrow(expect.objectContaining({ code: "unknown_account" }));
   });
 
   it("skips a provider with no connected banks", async () => {
-    const aggregate = new Aggregate([eu({ listAccountIds: setupRequired }), uk({ listAccountIds: async () => ["tl-a-1"] })]);
+    const aggregate = combine(eu({ listAccountIds: setupRequired }), uk({ listAccountIds: async () => ["tl-a-1"] }));
     await expect(aggregate.listAccountIds()).resolves.toEqual({ value: ["tl-a-1"], providerErrors: [] });
   });
 
   it("requires setup only when no provider has banks", async () => {
-    const aggregate = new Aggregate([eu({ listAccountIds: setupRequired }), uk({ listAccountIds: setupRequired })]);
+    const aggregate = combine(eu({ listAccountIds: setupRequired }), uk({ listAccountIds: setupRequired }));
     await expect(aggregate.listAccountIds()).rejects.toMatchObject({ code: "setup_required" });
   });
 
   it("keeps one provider's accounts when the other fails", async () => {
-    const aggregate = new Aggregate([eu({ listAccountIds: timeout("Enable Banking") }), uk({ listAccountIds: async () => ["tl-a-1"] })]);
+    const aggregate = combine(eu({ listAccountIds: timeout("Enable Banking") }), uk({ listAccountIds: async () => ["tl-a-1"] }));
     await expect(aggregate.listAccountIds()).resolves.toEqual({
       value: ["tl-a-1"],
       providerErrors: [{ provider: "enable_banking", code: "provider_timeout", message: "Enable Banking timed out." }],
@@ -90,23 +98,23 @@ describe("Aggregate", () => {
   });
 
   it("surfaces the real error when every provider fails, rather than setup_required", async () => {
-    const aggregate = new Aggregate([eu({ listAccountIds: setupRequired }), uk({ listAccountIds: timeout("TrueLayer") })]);
+    const aggregate = combine(eu({ listAccountIds: setupRequired }), uk({ listAccountIds: timeout("TrueLayer") }));
     await expect(aggregate.listAccountIds()).rejects.toMatchObject({ code: "provider_timeout" });
   });
 
   it("routes single-account reads to the owning provider", async () => {
     const euProvider = eu();
     const ukProvider = uk();
-    const aggregate = new Aggregate([euProvider, ukProvider]);
+    const aggregate = combine(euProvider, ukProvider);
     await aggregate.listTransactions("tl-a-1", {});
     await aggregate.getBalances("11111111-1111-4111-8111-111111111111");
-    expect(ukProvider.reader.listTransactions).toHaveBeenCalledWith("tl-a-1", {});
-    expect(euProvider.reader.getBalances).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111");
-    expect(euProvider.reader.listTransactions).not.toHaveBeenCalled();
+    expect(ukProvider.instance.listTransactions).toHaveBeenCalledWith("tl-a-1", {});
+    expect(euProvider.instance.getBalances).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111");
+    expect(euProvider.instance.listTransactions).not.toHaveBeenCalled();
   });
 
   it("rejects an account ID no configured provider owns", () => {
-    const aggregate = new Aggregate([eu()]);
+    const aggregate = combine(eu());
     expect(() => aggregate.listTransactions("tl-a-1", {})).toThrow(expect.objectContaining({ code: "unknown_account" }));
   });
 });

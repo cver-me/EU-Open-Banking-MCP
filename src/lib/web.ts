@@ -1,5 +1,6 @@
 // HTML, form, cookie, and CSRF helpers for the protected /setup pages.
-import { PublicError } from "../errors";
+import { z } from "zod";
+import { errorMessage, PublicError } from "../errors";
 import { readBoundedText } from "./http";
 
 const MAX_FORM_BYTES = 4_096;
@@ -90,4 +91,34 @@ export async function tokensMatch(left: string, right: string): Promise<boolean>
     crypto.subtle.digest("SHA-256", encoder.encode(right)),
   ]);
   return crypto.subtle.timingSafeEqual(leftHash, rightHash);
+}
+
+export function invalidState(): PublicError {
+  return new PublicError("The authorization state did not match. Start again.", "invalid_state");
+}
+
+/**
+ * Validates an OAuth redirect back from the bank: no error parameter, a code,
+ * and a state that matches the one stored in this flow's cookie. The cookie value may
+ * carry more dot-separated fields after the state; they are returned for the caller.
+ */
+export async function readAuthorizationCallback(
+  request: Request,
+  url: URL,
+  cookieName: string,
+): Promise<{ code: string; cookieFields: string[] }> {
+  if (url.searchParams.has("error")) {
+    throw new PublicError("Bank authorization was cancelled or denied.", "authorization_denied");
+  }
+  const code = z.string().min(1).max(4_096).parse(url.searchParams.get("code"));
+  const state = z.uuid().parse(url.searchParams.get("state"));
+  const [cookieState, ...cookieFields] = (readCookie(request, cookieName) ?? "").split(".");
+  const parsedCookieState = z.uuid().safeParse(cookieState);
+  if (!parsedCookieState.success || !(await tokensMatch(state, parsedCookieState.data))) throw invalidState();
+  return { code, cookieFields };
+}
+
+/** The error page every setup route returns, clearing that flow's callback cookie. */
+export function setupErrorResponse(error: unknown, clearCookie: string): Response {
+  return html(errorPage(errorMessage(error)), 400, clearCookie);
 }

@@ -2,13 +2,12 @@ import type {
   AccountReadError,
   AccountSummary,
   Balance,
-  ProviderName,
+  ProviderKey,
   TransactionPage,
   TransactionStatus,
 } from "../finance";
+import type { TokenCipher } from "../lib/crypto";
 import type { PsuContext } from "../lib/psu";
-
-export type { PsuContext } from "../lib/psu";
 
 export interface TransactionQuery {
   dateFrom?: string;
@@ -47,9 +46,33 @@ export interface ProviderSetup {
  * Adapters: Enable Banking (EU) and TrueLayer (UK).
  */
 export interface BankProvider {
-  readonly name: ProviderName;
+  /** Stable key, also reported in providerErrors. */
+  readonly name: ProviderKey;
+  /** Human-readable coverage, for example "UK banks (TrueLayer)". */
+  readonly label: string;
   /** True when an account ID was issued by this provider. IDs of different providers never overlap. */
   ownsAccountId(accountId: string): boolean;
   reader(psu: PsuContext): FinanceReader;
   readonly setup: ProviderSetup;
+}
+
+/** Deployment-wide settings a provider may use. */
+export interface SharedSettings {
+  /** KV namespace shared by all providers; each provider uses its own key prefix. */
+  kv: KVNamespace;
+  /** Present when TOKEN_ENCRYPTION_KEY is set: seals credentials before they reach KV. */
+  tokenCipher?: TokenCipher;
+}
+
+/**
+ * How a provider is discovered from Worker secrets. Adding a provider means writing
+ * one of these in its own folder and listing it in providers/registry.ts.
+ */
+export interface ProviderModule {
+  readonly key: ProviderKey;
+  readonly label: string;
+  /** Secret names that enable this provider; all must be set together. */
+  readonly secrets: readonly string[];
+  /** Undefined when none of `secrets` is set; throws on a partial or invalid configuration. */
+  fromEnv(env: Readonly<Record<string, unknown>>, shared: SharedSettings): BankProvider | undefined;
 }
