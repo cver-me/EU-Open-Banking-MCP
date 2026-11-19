@@ -14,7 +14,10 @@ const MCP_PROTOCOL_VERSION = "2026-07-28";
 
 let providerPrivateKeyPem: string;
 
-const productionEnv: Env = {
+// Provider secrets are optional and undeclared, so they are not part of Env.
+type WorkerEnv = Env & Record<string, unknown>;
+
+const productionEnv: WorkerEnv = {
   ENABLE_BANKING_APPLICATION_ID: "00000000-0000-4000-8000-000000000000",
   ENABLE_BANKING_PRIVATE_KEY_PEM:
     "-----BEGIN PRIVATE KEY-----\nnot-used-before-authentication\n-----END PRIVATE KEY-----",
@@ -40,10 +43,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function fetchAuthenticated(request: Request, workerEnv: Env = env): Promise<Response> {
+function fetchAuthenticated(request: Request, workerEnv: WorkerEnv = env): Promise<Response> {
   return worker.fetch(
     request as Parameters<typeof worker.fetch>[0],
-    workerEnv,
+    workerEnv as Env,
     createAuthenticatedContext(),
   );
 }
@@ -52,7 +55,7 @@ function callTool(
   id: number,
   name: string,
   args: Record<string, unknown>,
-  workerEnv: Env = env,
+  workerEnv: WorkerEnv = env,
 ): Promise<Response> {
   return fetchAuthenticated(
     createModernMcpRequest(id, "tools/call", { name, arguments: args }, name),

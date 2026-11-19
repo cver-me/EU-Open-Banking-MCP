@@ -2,8 +2,6 @@
 
 A self-hosted, read-only MCP server for accessing personal European bank accounts through [Enable Banking](https://enablebanking.com/), and optionally UK bank accounts through [TrueLayer](https://truelayer.com/), secured and deployed on Cloudflare Workers.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cver-me/eu-open-banking-mcp)
-
 > [!IMPORTANT]
 > Treat every deployment as a private financial system. The repository is open source; your Worker, MCP URL, secrets, session IDs, account IDs, and financial data are private.
 
@@ -117,13 +115,13 @@ You need:
 - an Enable Banking restricted-production application;
 - the application's UUID and RSA private key.
 
-Choose the Worker name before registering the Enable Banking application. Register this callback URL, replacing both placeholders:
+Choose the Worker name before registering the Enable Banking application (it is `name` in `cloudflare.config.ts`, `finance` by default). Register this callback URL, replacing both placeholders:
 
 ```text
 https://<worker-name>.<account-subdomain>.workers.dev/callback
 ```
 
-Register a production application, generate its RSA key outside the browser, and upload the matching public certificate in PEM format. Keep the private key: the deploy flow will store it as a Worker secret, and it must never be committed or shared.
+Register a production application, generate its RSA key outside the browser, and upload the matching public certificate in PEM format. Keep the private key: you will upload it as a Worker secret, and it must never be committed or shared.
 
 In the Enable Banking Control Panel, link every account the restricted application may access. Dashboard linking is the production whitelist; it does not authorize a session for the application. The Worker completes that second authorization through `/setup` after deployment. See Enable Banking's [linked-account guide](https://enablebanking.com/docs/api/linked-accounts).
 
@@ -131,26 +129,41 @@ This repository is intended for personal, non-commercial use. Confirm that your 
 
 ### 2. Deploy to Cloudflare
 
-Use the **Deploy to Cloudflare** button above. Cloudflare's deploy flow will:
+The project deploys with Cloudflare's [`cf` CLI](https://developers.cloudflare.com/cf/), which reads `cloudflare.config.ts`. You need Node.js 22.23+ or 24.22+ and [Bun](https://bun.sh/).
 
-1. copy the repository into the user's GitHub or GitLab account;
-2. ask for `ENABLE_BANKING_APPLICATION_ID` and `ENABLE_BANKING_PRIVATE_KEY_PEM`;
-3. provision the `SESSION_STORE` KV namespace;
-4. attach the Cloudflare Access policy required by this project;
-5. build and deploy the Worker with Workers Builds.
+1. Clone the repository, install dependencies, and sign in:
 
-The two secret fields initially contain masked placeholder values read from `.dev.vars.example`: an all-zero UUID and a `replace-me` private key. They are not existing credentials. Replace both fields with the production application UUID and private key before deploying.
+   ```sh
+   bun install
+   npx cf auth login
+   ```
 
-Cloudflare presents Access as optional because Workers can be public, but it is required by this project. On the deployment page, enable **Protect with Cloudflare Access**, choose **All traffic**, and add an authentication policy. For a personal deployment, allow only your exact identity (or your Cloudflare account if only trusted members belong to it). **Previews only** does not protect the production Worker.
+2. Put the secrets of the providers you use in a local `secrets.json` (git ignores it), for example:
 
-Cloudflare documents this behavior in [Deploy to Cloudflare buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
+   ```json
+   {
+     "ENABLE_BANKING_APPLICATION_ID": "<application UUID>",
+     "ENABLE_BANKING_PRIVATE_KEY_PEM": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+   }
+   ```
 
-### 3. Enable Managed OAuth
+3. Deploy with the secrets, then delete the file:
 
-1. Open Zero Trust → Access controls → Applications → the Access application created during deployment.
-2. Open **Advanced settings**, enable **Managed OAuth**, and save.
+   ```sh
+   bun run deploy -- --secrets-file secrets.json
+   rm secrets.json
+   ```
 
-If **Protect with Cloudflare Access** was not enabled during deployment, attach Worker-level Access manually before continuing. Until Access is attached, the Worker fails closed with `403 access_required` because Cloudflare did not provide `ctx.access`. Worker-level Access protects `/`, `/setup`, `/callback`, `/callback/truelayer`, and `/mcp` across the Worker's associated domains. See Cloudflare's [Worker-level Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
+   If your login has access to more than one Cloudflare account, prefix the command with `CLOUDFLARE_ACCOUNT_ID=<account id>` (or set `accountId` in `cloudflare.config.ts`).
+
+   The first deploy creates the `SESSION_STORE` KV namespace. Later deploys reuse the namespace bound to the Worker and keep secrets that are already set, so you only pass `--secrets-file` when a secret changes.
+
+### 3. Protect the Worker with Cloudflare Access
+
+Access is required by this project. Until it is attached, the Worker fails closed with `403 access_required` because Cloudflare did not provide `ctx.access`.
+
+1. In the Cloudflare dashboard, go to **Workers & Pages**, select the Worker, open the **Access** tab, and select **Protect this Worker behind Access**. Choose **All traffic** (**Previews only** does not protect the production Worker) and an authentication policy that allows only your exact identity. Worker-level Access protects every route, including `/`, `/setup`, `/callback`, `/callback/truelayer`, and `/mcp`, on all of the Worker's domains. See Cloudflare's [Worker-level Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
+2. Open Zero Trust → Access controls → Applications → the Worker's Access application, open **Advanced settings**, enable **Managed OAuth**, and save.
 
 Managed OAuth exposes the protected-resource and authorization-server discovery metadata used by MCP clients. Cloudflare validates the request before Worker invocation; this project does not duplicate Cloudflare's JWT verifier.
 
@@ -173,13 +186,7 @@ Enable Banking covers EEA banks only. UK accounts can be added through TrueLayer
    https://<your-worker>.workers.dev/callback/truelayer
    ```
 
-2. Store the credentials and a fresh encryption key as Worker secrets:
-
-   ```sh
-   npx wrangler secret put TRUELAYER_CLIENT_ID
-   npx wrangler secret put TRUELAYER_CLIENT_SECRET
-   openssl rand -base64 32 | npx wrangler secret put TOKEN_ENCRYPTION_KEY
-   ```
+2. Add the credentials and a fresh encryption key (`openssl rand -base64 32`) to `secrets.json` as `TRUELAYER_CLIENT_ID`, `TRUELAYER_CLIENT_SECRET`, and `TOKEN_ENCRYPTION_KEY`, then deploy with `bun run deploy -- --secrets-file secrets.json` and delete the file.
 
    The client ID and secret must be set together, and TrueLayer will not start without `TOKEN_ENCRYPTION_KEY`. A `sandbox-` client ID switches the Worker to TrueLayer's sandbox and adds Mock Bank.
 
@@ -239,7 +246,9 @@ bun run test
 bun run check
 ```
 
-For local development, put the secrets of the providers you use in `.dev.vars` and run `bun run dev`. To test TrueLayer locally, also register `http://localhost:8787/callback/truelayer` in TrueLayer Console. Generated Worker types come from `.dev.vars.example`, so they don't depend on your local secrets.
+For local development, put the secrets of the providers you use in `.dev.vars` and run `bun run dev` (`cf dev`, served at `http://localhost:8787`). To test TrueLayer locally, also register `http://localhost:8787/callback/truelayer` in TrueLayer Console. `bun run build` and `bun run check` need no Cloudflare login: `check` runs the typecheck, the tests, and `cf deploy --dry-run`.
+
+The Worker is configured in `cloudflare.config.ts` and bundled with Vite (`vite.config.ts`). `cf workers types` writes Worker types to `.cloudflare/types` from that file, so they don't depend on your local secrets. Provider secrets are optional, so the config declares them only in development mode (to load them from `.dev.vars`); deploys never require them. The Workers test plugin (`@cloudflare/vitest-plugin`) still installs Wrangler as its own dependency; the project itself no longer uses Wrangler.
 
 Tests run in the Cloudflare Workers runtime and cover every provider configuration (EU only, UK only, both, none, partial), Access fail-closed behavior, setup authorization, session discovery, account enforcement, MCP tool schemas, Enable Banking JWT construction, normalization, and bounded responses.
 
