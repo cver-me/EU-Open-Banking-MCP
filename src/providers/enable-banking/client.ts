@@ -15,6 +15,7 @@ import type {
 } from "../../finance";
 import { readBoundedJson } from "../../http";
 import type { SessionStore } from "../../session-store";
+import type { BalanceReadResult, FinanceProvider, TransactionQuery } from "../types";
 import {
   accountDetailsSchema,
   aspspsSchema,
@@ -36,13 +37,6 @@ import type { EnableBankingPsuHeaders } from "./psu-headers";
 const API_ORIGIN = "https://api.enablebanking.com";
 const REQUEST_TIMEOUT_MS = 10_000;
 
-interface TransactionQuery {
-  dateFrom?: string;
-  dateTo?: string;
-  status?: TransactionStatus;
-  continuationKey?: string;
-}
-
 interface AuthorizedAccount {
   accountId: string;
   institution: string;
@@ -50,10 +44,7 @@ interface AuthorizedAccount {
   identificationHash?: string;
 }
 
-export interface BalanceReadResult {
-  balances: Balance[];
-  errors: AccountReadError[];
-}
+export type { BalanceReadResult } from "../types";
 
 export interface ConnectionSummary {
   sessionId: string;
@@ -115,7 +106,7 @@ const TRANSACTION_STATUS_CODES = Object.fromEntries(
   Object.entries(TRANSACTION_STATUSES).map(([providerStatus, status]) => [status, providerStatus]),
 ) as Record<TransactionStatus, EnableBankingTransactionStatus>;
 
-export class EnableBankingClient {
+export class EnableBankingClient implements FinanceProvider {
   private keyPromise: Promise<CryptoKey> | undefined;
   private token: { promise: Promise<string>; refreshAt: number } | undefined;
   private accountsPromise: Promise<AuthorizedAccount[]> | undefined;

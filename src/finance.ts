@@ -1,8 +1,8 @@
 import { z } from "zod";
 
 export const accountIdSchema = z
-  .uuid()
-  .describe("Opaque Enable Banking account ID discovered from an active authorization session");
+  .union([z.uuid(), z.string().regex(/^tl-[ac]-[A-Za-z0-9_-]{1,128}$/)])
+  .describe("Opaque account ID discovered by finance_list_accounts from an active bank connection");
 
 export const countryCodeSchema = z
   .string()
@@ -61,7 +61,7 @@ export const transactionStatusSchema = z.enum([
 
 export const accountSummarySchema = z.object({
   accountId: accountIdSchema.describe("Opaque account ID accepted by the other finance tools"),
-  institution: z.string().describe("Bank or financial institution reported by Enable Banking"),
+  institution: z.string().describe("Bank or financial institution reported by the data provider"),
   country: countryCodeSchema,
   currency: currencySchema,
   name: z.string().optional().describe("Account holder name reported by the bank"),
@@ -170,4 +170,16 @@ export function resolveSpendingDate(
 export interface TransactionPage {
   transactions: Transaction[];
   continuationKey?: string;
+  /** The bank refused to share part of the requested range; no older pages follow. */
+  historyUnavailable?: boolean;
 }
+
+export const providerNameSchema = z.enum(["enable_banking", "truelayer"]);
+export type ProviderName = z.infer<typeof providerNameSchema>;
+
+export const providerErrorSchema = z.object({
+  provider: providerNameSchema.describe("Data provider that could not be read: enable_banking (EU banks) or truelayer (UK banks)"),
+  code: z.string().min(1).max(100).describe("Stable machine-readable failure code"),
+  message: z.string().min(1).max(500).describe("Safe explanation without provider payloads"),
+});
+export type ProviderError = z.infer<typeof providerErrorSchema>;

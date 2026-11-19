@@ -2,6 +2,8 @@ import { createExecutionContext, env } from "cloudflare:test";
 import { exportPKCS8, generateKeyPair } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
+import { KvTrueLayerConnectionStore } from "../src/providers/truelayer/connection-store";
+import { decodeEncryptionKey, TokenCipher } from "../src/token-crypto";
 
 const SESSION_STORE_KEY = "enable-banking-session-ids-v1";
 const INTESA_SESSION_ID = "22222222-2222-4222-8222-222222222222";
@@ -881,3 +883,70 @@ function parseLegacySsePayload(responseText: string): unknown {
   expect(dataLine).toBeDefined();
   return JSON.parse(dataLine ?? "null");
 }
+
+describe("Provider isolation", () => {
+  const KEY_BASE64 = btoa(String.fromCharCode(...new Uint8Array(32).fill(9)));
+  const CONNECTION_ID = "77777777-7777-4777-8777-777777777777";
+
+  async function invokeWithBothProviders(name: string, args: Record<string, unknown>) {
+    const workerEnv = {
+      ...env,
+      ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
+      TRUELAYER_CLIENT_ID: "personalfinance-abc123",
+      TRUELAYER_CLIENT_SECRET: "test-client-secret",
+      TOKEN_ENCRYPTION_KEY: KEY_BASE64,
+    } as Env;
+    const response = await callTool(20, name, args, workerEnv);
+    return (await response.json() as { result: { isError?: boolean; structuredContent: Record<string, unknown> } }).result;
+  }
+
+  beforeEach(async () => {
+    await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
+    await new KvTrueLayerConnectionStore(env.SESSION_STORE, new TokenCipher(decodeEncryptionKey(KEY_BASE64)))
+      .put(CONNECTION_ID, {
+        refreshToken: "refresh",
+        accessToken: "access",
+        accessTokenExpiresAt: Date.now() + 3_600_000,
+        providerName: "Starling",
+        createdAt: "2026-11-19T10:00:00.000Z",
+      });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      // Enable Banking is down; TrueLayer works.
+      if (url.hostname === "api.enablebanking.com") return Response.json({}, { status: 500 });
+      if (url.pathname === "/data/v1/accounts") {
+        return Response.json({ results: [{ account_id: "acc1", account_type: "TRANSACTION", display_name: "Personal", currency: "GBP" }] });
+      }
+      if (url.pathname === "/data/v1/cards") return Response.json({ results: [] });
+      if (url.pathname === "/data/v1/accounts/acc1/transactions") {
+        return Response.json({ results: [{
+          transaction_id: "t1", timestamp: "2026-11-10T12:00:00Z", amount: -12.5, currency: "GBP",
+          transaction_type: "DEBIT", transaction_category: "PURCHASE", transaction_classification: [],
+        }] });
+      }
+      throw new Error(`Unexpected fetch ${url.href}`);
+    });
+  });
+  afterEach(async () => env.SESSION_STORE.delete(`truelayer-connection-v1:${CONNECTION_ID}`));
+
+  it("lists UK accounts and reports the failing EU provider", async () => {
+    const result = await invokeWithBothProviders("finance_list_accounts", {});
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toMatchObject({
+      accounts: [{ accountId: "tl-a-acc1", institution: "Starling", country: "GB" }],
+      providerErrors: [{ provider: "enable_banking", code: "provider_error" }],
+    });
+  });
+
+  it("marks cash flow incomplete when a provider is unavailable", async () => {
+    const result = await invokeWithBothProviders("finance_summarize_cash_flow", {
+      dateFrom: "2026-11-01", dateTo: "2026-11-19",
+    });
+    expect(result.structuredContent).toMatchObject({
+      totalsByCurrency: { GBP: { credit: "0", debit: "12.5", net: "-12.5" } },
+      complete: false,
+      incompleteReasons: ["provider_unavailable"],
+      providerErrors: [{ provider: "enable_banking" }],
+    });
+  });
+});

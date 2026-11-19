@@ -16,6 +16,7 @@ The primary assets are:
 
 - the Enable Banking RSA private key and application ID;
 - Enable Banking session IDs stored in Workers KV;
+- TrueLayer client secret, `TOKEN_ENCRYPTION_KEY`, and the encrypted TrueLayer refresh/access tokens stored in Workers KV (optional UK support);
 - Cloudflare Access OAuth credentials and tokens;
 - balances, transactions, counterparties, and derived summaries.
 
@@ -25,8 +26,9 @@ The intended security boundary is:
 
 1. Worker-level Cloudflare Access authenticates the caller before invocation, and the Worker fails closed unless Cloudflare supplies a validated `ctx.access` context.
 2. The MCP layer exposes only bounded semantic read tools.
-3. The setup routes can only start, complete, and close Enable Banking account authorization; they are not MCP tools.
-4. The provider module discovers account IDs from active stored sessions and rejects other IDs.
+3. The setup routes can only start, complete, and close Enable Banking or TrueLayer account authorization; they are not MCP tools. TrueLayer authorization uses `state` plus PKCE.
+4. Each provider module discovers account IDs from active stored sessions or connections and rejects other IDs.
+   TrueLayer refresh tokens are long-lived credentials, so they are sealed with AES-256-GCM before reaching KV; reading KV alone does not reveal them.
 5. User-triggered account reads forward the bounded Cloudflare connecting-client IP and MCP client
    User-Agent as Enable Banking's `Psu-Ip-Address` and `Psu-User-Agent` headers. Those values are
    request-scoped and are neither stored nor logged.
@@ -40,7 +42,7 @@ Security claims assume that operators:
 - protect all Worker traffic with Worker-level Cloudflare Access, including `workers.dev` and any custom domains;
 - enable Managed OAuth on the generated Access application;
 - restrict Access to their own identity;
-- keep the Enable Banking private key in a Worker secret and session KV private;
+- keep the Enable Banking private key, TrueLayer client secret, and `TOKEN_ENCRYPTION_KEY` in Worker secrets and session KV private;
 - preserve Cloudflare's trusted `CF-Connecting-IP` handling and do not replace it with a
   caller-controlled forwarding header;
 - review dependency and Worker changes before deploying;

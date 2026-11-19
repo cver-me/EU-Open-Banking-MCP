@@ -1,7 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import type Decimal from "decimal.js";
 import { z } from "zod";
-import type { AppConfig } from "../config";
 import { errorMessage, PublicError } from "../errors";
 import {
   accountIdSchema,
@@ -12,18 +11,18 @@ import {
   exactDecimalAmountSchema,
   isoDateSchema,
   nonNegativeDecimalAmountSchema,
+  providerErrorSchema,
   resolveSpendingDate,
   spendingTransactionSchema,
   transactionSchema,
   transactionStatusSchema,
+  type ProviderError,
   type Transaction,
   type TransactionStatus,
   type SpendingTransaction,
 } from "../finance";
 import { Money } from "../money";
-import { EnableBankingClient } from "../providers/enable-banking/client";
-import type { EnableBankingPsuHeaders } from "../providers/enable-banking/psu-headers";
-import type { SessionStore } from "../session-store";
+import type { AggregateFinanceProvider } from "../providers/composite";
 
 const MAX_DATE_RANGE_DAYS = 366;
 const MAX_TRANSACTIONS_PER_RESULT = 200;
@@ -34,7 +33,13 @@ const MAX_SUMMARY_TRANSACTIONS = 10_000;
 // argument payloads before zod validation runs on them.
 const MAX_TOOL_INPUT_ELEMENTS = 32;
 const SPENDING_DATE_PADDING_DAYS = 7;
-const scanIncompleteReasonSchema = z.enum(["page_limit", "transaction_limit", "repeated_cursor"]);
+const scanIncompleteReasonSchema = z.enum([
+  "page_limit", "transaction_limit", "repeated_cursor", "history_unavailable", "provider_unavailable",
+]);
+const providerErrorsSchema = z
+  .array(providerErrorSchema)
+  .optional()
+  .describe("Providers that could not be read; their accounts are missing from this result. Present only when non-empty");
 type ScanIncompleteReason = z.infer<typeof scanIncompleteReasonSchema>;
 const spendingIncompleteReasonSchema = z.enum([
   ...scanIncompleteReasonSchema.options, "inferred_dates", "missing_dates", "unknown_status",
@@ -102,12 +107,7 @@ const pageCursorSchema = z.object({
   offset: z.number().int().min(0).max(5_000),
 });
 
-export function createFinanceServer(
-  config: AppConfig,
-  sessions: SessionStore,
-  psuHeaders?: EnableBankingPsuHeaders,
-): McpServer {
-  const provider = new EnableBankingClient(config, sessions, psuHeaders);
+export function createFinanceServer(provider: AggregateFinanceProvider): McpServer {
   const server = new McpServer(
     { name: "personal-finance-eu-mcp", version: "0.1.0" },
     { maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS },
@@ -118,12 +118,15 @@ export function createFinanceServer(
     {
       title: "List financial accounts",
       description:
-        "Discover accounts from active Enable Banking sessions and return opaque account IDs with bank-provided metadata. Never returns IBANs.",
+        "Discover accounts from active bank connections (EU banks via Enable Banking, UK banks via TrueLayer) and return opaque account IDs with bank-provided metadata. Never returns IBANs or account numbers.",
       inputSchema: z.object({}),
-      outputSchema: z.object({ accounts: z.array(accountSummarySchema) }),
+      outputSchema: z.object({ accounts: z.array(accountSummarySchema), providerErrors: providerErrorsSchema }),
       annotations,
     },
-    async () => safeResult(async () => ({ accounts: await provider.listAccounts() })),
+    async () => safeResult(async () => {
+      const result = await provider.listAccounts();
+      return { accounts: result.value, ...withProviderErrors(result.providerErrors) };
+    }),
   );
 
   server.registerTool(
@@ -136,13 +139,18 @@ export function createFinanceServer(
       outputSchema: z.object({
         balances: z.array(balanceSchema),
         errors: z.array(accountReadErrorSchema),
+        providerErrors: providerErrorsSchema,
       }),
       annotations,
     },
     async ({ accountId }) =>
       safeResult(async () => {
         const result = await provider.getBalances(accountId);
-        return { balances: result.balances, errors: result.errors };
+        return {
+          balances: result.value.balances,
+          errors: result.value.errors,
+          ...withProviderErrors(result.providerErrors),
+        };
       }),
   );
 
@@ -188,12 +196,13 @@ export function createFinanceServer(
           held: z.record(currencySchema, nonNegativeDecimalAmountSchema),
         }).describe("Separate gross debit totals by lifecycle status; pending and held amounts are not settled spending"),
         incompleteReasons: z.array(spendingIncompleteReasonSchema),
+        providerErrors: providerErrorsSchema,
       }),
       annotations,
     },
     async ({ accountId, dateFrom, dateTo, includeTransactions }) =>
       safeResult(async () => {
-        const accountIds = accountId === undefined ? await provider.listAccountIds() : [accountId];
+        const { accountIds, providerErrors } = await selectAccountIds(provider, accountId);
         const totals = new Map<string, Decimal>();
         const statusTotals = {
           booked: new Map<string, Decimal>(),
@@ -251,6 +260,7 @@ export function createFinanceServer(
         );
 
         for (const reason of scan.incompleteReasons) incompleteReasons.add(reason);
+        if (providerErrors.length > 0) incompleteReasons.add("provider_unavailable");
         return {
           totalsByCurrency: Object.fromEntries(
             [...totals.entries()].map(([currency, total]) => [currency, total.toFixed()]),
@@ -266,6 +276,7 @@ export function createFinanceServer(
             status, Object.fromEntries([...byCurrency].map(([currency, total]) => [currency, total.toFixed()])),
           ])),
           incompleteReasons: [...incompleteReasons],
+          ...withProviderErrors(providerErrors),
         };
       }),
   );
@@ -298,6 +309,10 @@ export function createFinanceServer(
           .string()
           .optional()
           .describe("Opaque cursor to continue the same query; absent when no further page is available"),
+        historyUnavailable: z
+          .literal(true)
+          .optional()
+          .describe("The bank refused to share part of this date range (usually history older than about 90 days for UK banks); no older pages follow"),
       }),
       annotations,
     },
@@ -339,7 +354,11 @@ export function createFinanceServer(
           });
         }
 
-        return nextCursor === undefined ? { transactions } : { transactions, nextCursor };
+        return {
+          transactions,
+          ...(nextCursor === undefined ? {} : { nextCursor }),
+          ...(page.historyUnavailable === true && nextCursor === undefined ? { historyUnavailable: true as const } : {}),
+        };
       }),
   );
 
@@ -381,6 +400,7 @@ export function createFinanceServer(
         let continuationKey: string | undefined;
         let pagesScanned = 0;
         let stoppedAtLimit = false;
+        let historyUnavailable = false;
         const visitedCursors = new Set<string>();
 
         do {
@@ -395,6 +415,7 @@ export function createFinanceServer(
             ...(continuationKey === undefined ? {} : { continuationKey }),
           });
           pagesScanned += 1;
+          if (page.historyUnavailable === true) historyUnavailable = true;
           for (const [index, transaction] of page.transactions.entries()) {
             const haystack = [transaction.counterparty, transaction.description, transaction.reference,
               transaction.paymentReference, transaction.bankTransactionDescription]
@@ -416,7 +437,7 @@ export function createFinanceServer(
 
         return {
           transactions: matches,
-          complete: continuationKey === undefined && !stoppedAtLimit,
+          complete: continuationKey === undefined && !stoppedAtLimit && !historyUnavailable,
           pagesScanned,
         };
       }),
@@ -444,12 +465,13 @@ export function createFinanceServer(
           .describe("True only when all active accounts and provider pages were included"),
         pagesScanned: z.number().int().describe("Total provider pages included in the summary"),
         incompleteReasons: z.array(scanIncompleteReasonSchema),
+        providerErrors: providerErrorsSchema,
       }),
       annotations,
     },
     async ({ accountId, dateFrom, dateTo }) =>
       safeResult(async () => {
-        const accountIds = accountId === undefined ? await provider.listAccountIds() : [accountId];
+        const { accountIds, providerErrors } = await selectAccountIds(provider, accountId);
         const totals = new Map<string, { credit: Decimal; debit: Decimal }>();
         let transactionsIncluded = 0;
         const scan = await scanSummaryTransactions(
@@ -480,9 +502,12 @@ export function createFinanceServer(
         return {
           totalsByCurrency,
           transactionsIncluded,
-          complete: scan.complete,
+          complete: scan.complete && providerErrors.length === 0,
           pagesScanned: scan.pagesScanned,
-          incompleteReasons: scan.incompleteReasons,
+          incompleteReasons: providerErrors.length === 0
+            ? scan.incompleteReasons
+            : [...scan.incompleteReasons, "provider_unavailable" as const],
+          ...withProviderErrors(providerErrors),
         };
       }),
   );
@@ -490,8 +515,21 @@ export function createFinanceServer(
   return server;
 }
 
+async function selectAccountIds(
+  provider: AggregateFinanceProvider,
+  accountId: string | undefined,
+): Promise<{ accountIds: string[]; providerErrors: ProviderError[] }> {
+  if (accountId !== undefined) return { accountIds: [accountId], providerErrors: [] };
+  const result = await provider.listAccountIds();
+  return { accountIds: result.value, providerErrors: result.providerErrors };
+}
+
+function withProviderErrors(providerErrors: ProviderError[]): { providerErrors?: ProviderError[] } {
+  return providerErrors.length === 0 ? {} : { providerErrors };
+}
+
 async function scanSummaryTransactions(
-  provider: EnableBankingClient,
+  provider: Pick<AggregateFinanceProvider, "listTransactions">,
   accountIds: string[],
   filters: { dateFrom: string; dateTo: string; status?: TransactionStatus },
   visit: (transaction: Transaction) => void,
@@ -525,6 +563,10 @@ async function scanSummaryTransactions(
         ...(continuationKey === undefined ? {} : { continuationKey }),
       });
       pagesScanned += 1;
+      if (page.historyUnavailable === true) {
+        complete = false;
+        incompleteReasons.add("history_unavailable");
+      }
       for (const transaction of page.transactions) {
         if (transactionsScanned >= MAX_SUMMARY_TRANSACTIONS) {
           complete = false;

@@ -2,11 +2,14 @@ import { PublicError } from "./errors";
 
 const MAX_UPSTREAM_BYTES = 1_000_000;
 
-export async function readBoundedJson(response: Response): Promise<unknown> {
+export async function readBoundedJson(
+  response: Response,
+  maxBytes: number = MAX_UPSTREAM_BYTES,
+): Promise<unknown> {
   if (response.body === null) return null;
   const text = await readBoundedText(
     response,
-    MAX_UPSTREAM_BYTES,
+    maxBytes,
     new PublicError("The provider response was unexpectedly large.", "upstream_too_large"),
   );
 

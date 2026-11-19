@@ -20,6 +20,11 @@ export function enableBankingPsuHeadersFromRequest(
   ];
 }
 
+/** The end user's IP address as reported by Cloudflare, when well-formed. */
+export function connectingIpAddress(request: Request): string | undefined {
+  return validIpAddress(request.headers.get("CF-Connecting-IP"));
+}
+
 function validIpAddress(value: string | null): string | undefined {
   const bounded = boundedHeader(value, MAX_IP_ADDRESS_LENGTH);
   if (bounded === undefined || !/^[0-9A-Fa-f:.]+$/.test(bounded)) return undefined;

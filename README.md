@@ -1,6 +1,6 @@
 # EU Open Banking MCP
 
-A self-hosted, read-only MCP server for accessing personal European bank accounts through [Enable Banking](https://enablebanking.com/), secured and deployed on Cloudflare Workers.
+A self-hosted, read-only MCP server for accessing personal European bank accounts through [Enable Banking](https://enablebanking.com/), and optionally UK bank accounts through [TrueLayer](https://truelayer.com/), secured and deployed on Cloudflare Workers.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cver-me/eu-open-banking-mcp)
 
@@ -33,14 +33,16 @@ Dashboard linking is not itself API authorization. After deployment, `/setup` st
 flowchart LR
   C[ChatGPT, Codex, or another MCP client] --> A[Cloudflare Access]
   A -->|platform-validated ctx.access| W[Stateless MCP Worker]
-  W -->|session IDs only| K[Workers KV]
+  W -->|session IDs, encrypted TrueLayer tokens| K[Workers KV]
   W -->|request-scoped RS256 JWT| E[Enable Banking]
-  E --> B[Your bank]
+  W -.->|optional: OAuth access token| T[TrueLayer]
+  E --> B[Your EU bank]
+  T --> U[Your UK bank]
 ```
 
 - Client → MCP: Cloudflare Access Managed OAuth, restricted to the deployment owner.
 - MCP → Enable Banking: a one-hour RS256 JWT signed from a private key stored as a Worker secret. Signing is shared across provider calls within one incoming request; tokens are not shared between requests.
-- Storage: KV contains only Enable Banking session IDs created through the protected setup flow.
+- Storage: KV contains Enable Banking session IDs and, when TrueLayer is configured, one AES-256-GCM-encrypted record per UK connection (refresh token, cached access token, bank name, consent expiry). The encryption key is the `TOKEN_ENCRYPTION_KEY` Worker secret; each ciphertext is bound to its KV key.
 - Online account reads: the Worker forwards Cloudflare's connecting-client IP and the MCP client's
   User-Agent as Enable Banking's `Psu-Ip-Address` and `Psu-User-Agent` headers. These request-scoped
   values are not stored or logged. This tells the bank that the signed-in owner actively requested
@@ -144,6 +146,34 @@ Managed OAuth exposes the protected-resource and authorization-server discovery 
 
 If consent expires or is revoked, return to `/setup`, remove the inactive session, and connect the bank again. Removing a connection also asks Enable Banking to close its consent. Enable Banking creates new session and account IDs during reauthorization; the MCP discovers them automatically.
 
+### 4b. Optional: UK banks through TrueLayer
+
+Enable Banking covers EEA banks only. UK accounts can be added through TrueLayer's Data API.
+
+1. In [TrueLayer Console](https://console.truelayer.com/), create an app, switch it to **Live**, and register this redirect URI:
+
+   ```text
+   https://<your-worker>.workers.dev/callback/truelayer
+   ```
+
+2. Store the credentials and a fresh encryption key as Worker secrets:
+
+   ```sh
+   npx wrangler secret put TRUELAYER_CLIENT_ID
+   npx wrangler secret put TRUELAYER_CLIENT_SECRET
+   openssl rand -base64 32 | npx wrangler secret put TOKEN_ENCRYPTION_KEY
+   ```
+
+   All three must be set together. A `sandbox-` client ID switches the Worker to TrueLayer's sandbox and adds Mock Bank.
+
+3. Open `/setup`, choose **Connect a UK bank**, and authorize at the bank. The callback validates `state`, completes a PKCE code exchange with the `offline_access` scope, and stores the encrypted refresh token.
+
+UK accounts appear in the same tools with IDs prefixed `tl-a-` (bank accounts) or `tl-c-` (cards). TrueLayer has no pagination; the Worker reads transactions in 92-day windows, newest first, and exposes each window as a page, so a one-year scan takes four pages per account. UK consent must be reconfirmed every 90 days: `/setup` shows the expiry date, warns 14 days ahead, and has a **Reconnect** button that removes the old connection once the same bank is connected again. Most UK banks only share history older than 90 days shortly after connecting. Banks that refuse older dates make `finance_list_transactions` return `historyUnavailable: true` and the scanning tools report `history_unavailable` in `incompleteReasons`; some banks (Starling, for example) return empty results instead, which cannot be told apart from no activity.
+
+If one provider fails while the other works, all-account tools still return the working provider's accounts and list the failure in `providerErrors`; spending and cash-flow results are then marked incomplete with `provider_unavailable`.
+
+Rotating `TOKEN_ENCRYPTION_KEY` makes stored TrueLayer connections unreadable; reconnect them afterwards.
+
 ### 5. Connect an MCP client
 
 Use this MCP URL:
@@ -168,7 +198,7 @@ There is intentionally no `/health` endpoint. Cloudflare Workers do not require 
 
 ## Security properties
 
-- Fixed upstream origin: requests can only go to `https://api.enablebanking.com`.
+- Fixed upstream origins: requests can only go to `https://api.enablebanking.com` and, when configured, `https://auth.truelayer.com` and `https://api.truelayer.com` (or their sandbox equivalents).
 - Fixed provider operations: setup can start, complete, and close account authorization; MCP tools perform only documented read calls.
 - User-triggered account reads forward bounded `Psu-Ip-Address` and `Psu-User-Agent` values derived
   from the incoming Cloudflare request; session discovery and authorization requests do not receive
@@ -176,7 +206,7 @@ There is intentionally no `/health` endpoint. Cloudflare Workers do not require 
 - Account enforcement: every supplied account ID must belong to an active stored session.
 - Setup and callback routes are behind Worker-level Access and validate origin/state.
 - Authorization codes are exchanged immediately and never persisted.
-- KV stores only session IDs and is encrypted at rest by Cloudflare.
+- KV stores Enable Banking session IDs and application-encrypted TrueLayer token records, and is also encrypted at rest by Cloudflare. TrueLayer reads forward only the bounded connecting-client IP as `X-PSU-IP`.
 - Bounded inputs, dates, pages, results, upstream responses, and timeouts.
 - Provider failures log only a normalized operation, HTTP status, allowlisted provider error code,
   and bounded `Retry-After` value—never identifiers, request headers, provider bodies, or financial data.
@@ -192,8 +222,10 @@ bun run test
 bun run check
 ```
 
+To try TrueLayer locally, put its three values in `.dev.vars`, register `http://localhost:8787/callback/truelayer` in TrueLayer Console, and run `bun run dev:truelayer`. Plain `wrangler dev` ignores the TrueLayer values because it only loads `.dev.vars` secrets listed in `secrets.required`; the script runs it with a gitignored config copy that lists them. Deployed Workers keep secrets set with `wrangler secret put` either way.
+
 Tests run in the Cloudflare Workers runtime and cover configuration, Access fail-closed behavior, setup authorization, session discovery, account enforcement, MCP tool schemas, Enable Banking JWT construction, normalization, and bounded responses.
 
 ## Provider scope
 
-Enable Banking is the first provider module. Future providers should expose the same narrow normalized finance interface rather than leaking generic provider HTTP operations into MCP tools. Contributions must remain read-only from MCP and include tests for identifier validation and response normalization.
+Enable Banking (EU) and TrueLayer (UK) implement the same `FinanceProvider` interface, and a composite provider routes account IDs to the right one. Future providers should expose the same narrow normalized finance interface rather than leaking generic provider HTTP operations into MCP tools. Contributions must remain read-only from MCP and include tests for identifier validation and response normalization.

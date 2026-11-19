@@ -7,6 +7,7 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:truelayer": "bun scripts/dev-truelayer.ts",
     "types": "wrangler types --strict-vars false",
     "typecheck": "bun run types && tsc --noEmit",
     "test": "vitest run",
