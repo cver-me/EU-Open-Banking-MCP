@@ -1,3 +1,4 @@
+import type { z } from "zod";
 import { importPKCS8, SignJWT } from "jose";
 import { PublicError } from "../../errors";
 import { formatAmount, Money } from "../../lib/money";
@@ -121,6 +122,7 @@ export class EnableBankingClient implements FinanceReader {
   private keyPromise: Promise<CryptoKey> | undefined;
   private token: { promise: Promise<string>; refreshAt: number } | undefined;
   private accountsPromise: Promise<AuthorizedAccount[]> | undefined;
+  private readonly detailsPromises = new Map<string, Promise<z.output<typeof accountDetailsSchema>>>();
 
   private readonly psuHeaders: EnableBankingPsuHeaders | undefined;
 
@@ -138,13 +140,7 @@ export class EnableBankingClient implements FinanceReader {
       groupBy(accounts, (account) => `${account.country}\u0000${account.institution}`).map(async (group) => {
         const summaries: AccountSummary[] = [];
         for (const { accountId, institution, country } of group) {
-          const details = accountDetailsSchema.parse(
-            await this.request(
-              `/accounts/${encodeURIComponent(accountId)}/details`,
-              {},
-              true,
-            ),
-          );
+          const details = await this.accountDetails(accountId);
           const name = optionalText(details.name);
           const product = optionalText(details.product);
           const description = optionalText(details.details);
@@ -347,10 +343,47 @@ export class EnableBankingClient implements FinanceReader {
 
   private async selectAccounts(accountId?: string): Promise<AuthorizedAccount[]> {
     const accounts = await this.authorizedAccounts();
-    if (accountId === undefined) return uniqueAccounts(accounts);
+    if (accountId === undefined) return this.uniqueAccounts(accounts);
     const account = accounts.find((candidate) => candidate.accountId === accountId);
     if (account === undefined) throw unknownAccount();
     return [account];
+  }
+
+  /** Account details, read at most once per request. */
+  private accountDetails(accountId: string): Promise<z.output<typeof accountDetailsSchema>> {
+    let promise = this.detailsPromises.get(accountId);
+    if (promise === undefined) {
+      promise = this.request(`/accounts/${encodeURIComponent(accountId)}/details`, {}, true)
+        .then((value) => accountDetailsSchema.parse(value));
+      this.detailsPromises.set(accountId, promise);
+    }
+    return promise;
+  }
+
+  /**
+   * Drops an account only when another session already returned the same account.
+   * The primary identification hash is based on the account number, so currency
+   * accounts sharing one IBAN (e.g. Revolut EUR and GBP) share a hash: when hashes
+   * collide, the currency must match too. Holder names and balances are never used.
+   */
+  private async uniqueAccounts(accounts: AuthorizedAccount[]): Promise<AuthorizedAccount[]> {
+    const hashCounts = new Map<string, number>();
+    for (const { identificationHash } of accounts) {
+      if (identificationHash !== undefined) hashCounts.set(identificationHash, (hashCounts.get(identificationHash) ?? 0) + 1);
+    }
+    const keys = await Promise.all(accounts.map(async (account) => {
+      const hash = account.identificationHash;
+      if (hash === undefined) return undefined;
+      if (hashCounts.get(hash) === 1) return hash;
+      // Only colliding accounts pay for a details read. If it fails, keep the account visible.
+      try {
+        return `${hash}\u0000${(await this.accountDetails(account.accountId)).currency}`;
+      } catch {
+        return undefined;
+      }
+    }));
+    return uniqueBy(accounts.map((account, index) => ({ account, key: keys[index] })), ({ key }) => key)
+      .map(({ account }) => account);
   }
 
   private async authorizedAccounts(): Promise<AuthorizedAccount[]> {
@@ -492,11 +525,6 @@ function providerOperation(path: string): string {
   return "unknown";
 }
 
-function uniqueAccounts(accounts: AuthorizedAccount[]): AuthorizedAccount[] {
-  // Only the primary hash is documented for unique matching. Secondary hashes
-  // are fuzzy identifiers. Never guess identity from holder names or balances.
-  return uniqueBy(accounts, (account) => account.identificationHash);
-}
 
 function normalizeTransaction(accountId: string, transaction: EnableBankingTransaction): Transaction {
   const credit = transaction.credit_debit_indicator === "CRDT";
