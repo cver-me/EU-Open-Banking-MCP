@@ -1,7 +1,5 @@
 import { importPKCS8, SignJWT } from "jose";
-import type { z } from "zod";
-import type { AppConfig } from "../../config";
-import { errorMessage, PublicError } from "../../errors";
+import { PublicError } from "../../errors";
 import type {
   AccountReadError,
   AccountSummary,
@@ -13,9 +11,20 @@ import type {
   TransactionPage,
   TransactionStatus,
 } from "../../finance";
-import { readBoundedJson } from "../../http";
-import type { SessionStore } from "../../session-store";
-import type { BalanceReadResult, FinanceProvider, TransactionQuery } from "../types";
+import { readBoundedJson } from "../../lib/http";
+import type { PsuContext } from "../../lib/psu";
+import {
+  accountReadError,
+  isBankRateLimit,
+  optionalText,
+  parseProviderResponse,
+  providerTimeout as sharedProviderTimeout,
+  setupRequired,
+  unknownAccount,
+} from "../shared";
+import type { BalanceReadResult, FinanceReader, TransactionQuery } from "../types";
+import type { EnableBankingConfig } from "./config";
+import type { SessionStore } from "./session-store";
 import {
   accountDetailsSchema,
   aspspsSchema,
@@ -32,9 +41,10 @@ import {
   type EnableBankingTransaction,
   type EnableBankingTransactionStatus,
 } from "./schemas";
-import type { EnableBankingPsuHeaders } from "./psu-headers";
+import { enableBankingPsuHeaders, type EnableBankingPsuHeaders } from "./psu-headers";
 
 const API_ORIGIN = "https://api.enablebanking.com";
+const PROVIDER_LABEL = "Enable Banking";
 const REQUEST_TIMEOUT_MS = 10_000;
 
 interface AuthorizedAccount {
@@ -43,8 +53,6 @@ interface AuthorizedAccount {
   country: string;
   identificationHash?: string;
 }
-
-export type { BalanceReadResult } from "../types";
 
 export interface ConnectionSummary {
   sessionId: string;
@@ -106,16 +114,20 @@ const TRANSACTION_STATUS_CODES = Object.fromEntries(
   Object.entries(TRANSACTION_STATUSES).map(([providerStatus, status]) => [status, providerStatus]),
 ) as Record<TransactionStatus, EnableBankingTransactionStatus>;
 
-export class EnableBankingClient implements FinanceProvider {
+export class EnableBankingClient implements FinanceReader {
   private keyPromise: Promise<CryptoKey> | undefined;
   private token: { promise: Promise<string>; refreshAt: number } | undefined;
   private accountsPromise: Promise<AuthorizedAccount[]> | undefined;
 
+  private readonly psuHeaders: EnableBankingPsuHeaders | undefined;
+
   constructor(
-    private readonly config: AppConfig,
+    private readonly config: EnableBankingConfig,
     private readonly sessions: SessionStore,
-    private readonly psuHeaders?: EnableBankingPsuHeaders,
-  ) {}
+    psu?: PsuContext,
+  ) {
+    this.psuHeaders = enableBankingPsuHeaders(psu);
+  }
 
   async listAccounts(): Promise<AccountSummary[]> {
     const accounts = await this.selectAccounts();
@@ -168,10 +180,7 @@ export class EnableBankingClient implements FinanceProvider {
             balances.push(...(await this.getAccountBalances(account)));
           } catch (error) {
             errors.push(accountReadError(account, error));
-            if (
-              error instanceof PublicError &&
-              (error.code === "aspsp_rate_limited" || error.code === "provider_rate_limited")
-            ) {
+            if (isBankRateLimit(error)) {
               for (const skippedAccount of group.slice(index + 1)) {
                 errors.push(accountReadError(skippedAccount, error));
               }
@@ -197,8 +206,7 @@ export class EnableBankingClient implements FinanceProvider {
         {},
         true,
       ),
-      "get_account_balances",
-      "balance",
+      { providerLabel: PROVIDER_LABEL, operation: "get_account_balances", dataKind: "balance" },
     );
     return response.balances.map((balance) => {
       const label = optionalText(balance.name);
@@ -429,12 +437,12 @@ export class EnableBankingClient implements FinanceProvider {
   }
 
   private async signAuthorizationToken(now: number): Promise<string> {
-    this.keyPromise ??= importPKCS8(this.config.enableBanking.privateKeyPem, "RS256");
+    this.keyPromise ??= importPKCS8(this.config.privateKeyPem, "RS256");
     return new SignJWT({})
       .setProtectedHeader({
         alg: "RS256",
         typ: "JWT",
-        kid: this.config.enableBanking.applicationId,
+        kid: this.config.applicationId,
       })
       .setIssuer("enablebanking.com")
       .setAudience("api.enablebanking.com")
@@ -500,37 +508,15 @@ export class EnableBankingClient implements FinanceProvider {
 }
 
 function parseTransactionsResponse(value: unknown) {
-  return parseProviderResponse(transactionsSchema, value, "get_account_transactions", "transaction");
+  return parseProviderResponse(transactionsSchema, value, {
+    providerLabel: PROVIDER_LABEL, operation: "get_account_transactions", dataKind: "transaction",
+  });
 }
 
-function parseProviderResponse<T extends z.ZodType>(
-  schema: T,
-  value: unknown,
-  operation: "get_account_balances" | "get_account_transactions",
-  dataKind: "balance" | "transaction",
-): z.output<T> {
-  const parsed = schema.safeParse(value);
-  if (parsed.success) {
-    return parsed.data;
-  }
-
-  console.error(
-    JSON.stringify({
-      message: "Enable Banking response validation failed",
-      operation,
-      issueCount: parsed.error.issues.length,
-      issues: parsed.error.issues.slice(0, 10).map((issue) => ({
-        code: issue.code,
-        path: issue.path.map(String).join("."),
-      })),
-    }),
-  );
-
-  throw new PublicError(
-    `Enable Banking returned unsupported ${dataKind} data.`,
-    "provider_response_invalid",
-  );
+function providerTimeout(): PublicError {
+  return sharedProviderTimeout(PROVIDER_LABEL);
 }
+
 
 async function providerError(response: Response, operation: string): Promise<PublicError> {
   let errorCode: string | undefined;
@@ -636,33 +622,9 @@ function uniqueAccounts(accounts: AuthorizedAccount[]): AuthorizedAccount[] {
   });
 }
 
-function accountReadError(account: AuthorizedAccount, error: unknown): AccountReadError {
-  return {
-    accountId: account.accountId,
-    institution: account.institution,
-    country: account.country,
-    code: error instanceof PublicError ? error.code : "provider_error",
-    message: errorMessage(error),
-  };
-}
 
-function providerTimeout(): PublicError {
-  return new PublicError("Enable Banking timed out. Try again shortly.", "provider_timeout");
-}
 
-function setupRequired(): PublicError {
-  return new PublicError(
-    "No active bank authorization is available. Open /setup to connect or renew a bank.",
-    "setup_required",
-  );
-}
 
-function unknownAccount(): PublicError {
-  return new PublicError(
-    "Unknown or inactive account ID. Call finance_list_accounts again.",
-    "unknown_account",
-  );
-}
 
 function normalizeTransaction(accountId: string, transaction: EnableBankingTransaction): Transaction {
   const credit = transaction.credit_debit_indicator === "CRDT";
@@ -694,6 +656,3 @@ function normalizeTransaction(accountId: string, transaction: EnableBankingTrans
   };
 }
 
-function optionalText(value: string | null | undefined): string | undefined {
-  return value?.trim() || undefined;
-}

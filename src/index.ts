@@ -1,17 +1,10 @@
 import { createMcpHandler } from "agents/mcp/server";
-import { loadConfig } from "./config";
+import { Aggregate } from "./aggregate";
+import { psuContextFromRequest } from "./lib/psu";
 import { createFinanceServer } from "./mcp/server";
-import { CompositeFinanceProvider } from "./providers/composite";
-import { EnableBankingClient } from "./providers/enable-banking/client";
-import {
-  connectingIpAddress,
-  enableBankingPsuHeadersFromRequest,
-} from "./providers/enable-banking/psu-headers";
-import { TrueLayerClient } from "./providers/truelayer/client";
-import { KvTrueLayerConnectionStore } from "./providers/truelayer/connection-store";
-import { KvSessionStore } from "./session-store";
+import { configuredProviders, type ProviderEnv } from "./providers/registry";
+import type { BankProvider } from "./providers/types";
 import { handleSetupRequest } from "./setup";
-import { TokenCipher } from "./token-crypto";
 
 const SECURITY_HEADERS = {
   "Cache-Control": "no-store",
@@ -34,9 +27,9 @@ export default {
       return withSecurityHeaders(Response.json({ error: "access_required" }, { status: 403 }));
     }
 
-    let config;
+    let providers: BankProvider[];
     try {
-      config = loadConfig(env);
+      providers = configuredProviders(env as unknown as ProviderEnv);
     } catch (error) {
       console.error(
         JSON.stringify({
@@ -47,28 +40,21 @@ export default {
       return withSecurityHeaders(Response.json({ error: "service_unavailable" }, { status: 503 }));
     }
 
-    const url = new URL(request.url);
-    const sessions = new KvSessionStore(env.SESSION_STORE);
-    const trueLayerStore = config.trueLayer === undefined
-      ? undefined
-      : new KvTrueLayerConnectionStore(env.SESSION_STORE, new TokenCipher(config.trueLayer.tokenEncryptionKey));
-    const setupResponse = await handleSetupRequest(request, config, sessions, trueLayerStore);
+    const setupResponse = await handleSetupRequest(request, providers);
     if (setupResponse !== undefined) return withSecurityHeaders(setupResponse);
 
-    if (url.pathname !== "/mcp") {
+    if (new URL(request.url).pathname !== "/mcp") {
       return withSecurityHeaders(Response.json({ error: "not_found" }, { status: 404 }));
     }
 
-    const psuHeaders = enableBankingPsuHeadersFromRequest(request);
-    const ipAddress = connectingIpAddress(request);
-    const handler = createMcpHandler(() => {
-      // Clients are request-scoped: they share token work within one request only.
-      const enableBanking = new EnableBankingClient(config, sessions, psuHeaders);
-      const trueLayer = config.trueLayer === undefined || trueLayerStore === undefined
-        ? undefined
-        : new TrueLayerClient(config.trueLayer, trueLayerStore, ipAddress === undefined ? {} : { ipAddress });
-      return createFinanceServer(new CompositeFinanceProvider(enableBanking, trueLayer));
-    }, {
+    const psu = psuContextFromRequest(request);
+    const handler = createMcpHandler(() =>
+      // Readers are request-scoped: they share token work within one request only.
+      createFinanceServer(new Aggregate(providers.map((provider) => ({
+        name: provider.name,
+        ownsAccountId: provider.ownsAccountId,
+        reader: provider.reader(psu),
+      })))), {
       route: "/mcp",
       corsOptions: false,
       legacy: "stateless",

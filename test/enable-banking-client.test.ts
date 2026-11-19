@@ -1,15 +1,15 @@
 import { exportPKCS8, generateKeyPair, jwtVerify } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AppConfig } from "../src/config";
+import type { EnableBankingConfig } from "../src/providers/enable-banking/config";
 import { EnableBankingClient } from "../src/providers/enable-banking/client";
-import type { SessionStore } from "../src/session-store";
+import type { SessionStore } from "../src/providers/enable-banking/session-store";
 
 const SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const SECOND_SESSION_ID = "55555555-5555-4555-8555-555555555555";
 const ACCOUNT_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_ACCOUNT_ID = "44444444-4444-4444-8444-444444444444";
 
-let config: AppConfig;
+let config: EnableBankingConfig;
 let providerPublicKey: CryptoKey;
 let sessions: SessionStore;
 
@@ -17,10 +17,8 @@ beforeAll(async () => {
   const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
   providerPublicKey = publicKey;
   config = {
-    enableBanking: {
-      applicationId: "00000000-0000-4000-8000-000000000000",
-      privateKeyPem: await exportPKCS8(privateKey),
-    },
+    applicationId: "00000000-0000-4000-8000-000000000000",
+    privateKeyPem: await exportPKCS8(privateKey),
   };
 });
 
@@ -245,7 +243,7 @@ describe("EnableBankingClient", () => {
     expect(protectedHeader).toMatchObject({
       alg: "RS256",
       typ: "JWT",
-      kid: config.enableBanking.applicationId,
+      kid: config.applicationId,
     });
     expect(payload.exp).toBe((payload.iat ?? 0) + 3_600);
     expect(JSON.stringify(result)).not.toContain("provider-transaction-id-not-exposed");
@@ -420,10 +418,10 @@ describe("EnableBankingClient", () => {
 
   it("forwards online PSU context only to account-data requests", async () => {
     const fetchMock = mockProvider(async () => Response.json({ balances: [] }));
-    const client = new EnableBankingClient(config, sessions, [
-      ["Psu-Ip-Address", "203.0.113.7"],
-      ["Psu-User-Agent", "Personal Finance MCP Test"],
-    ]);
+    const client = new EnableBankingClient(config, sessions, {
+      ipAddress: "203.0.113.7",
+      userAgent: "Personal Finance MCP Test",
+    });
 
     await client.getBalances(ACCOUNT_ID);
 

@@ -1,7 +1,9 @@
 import { z } from "zod";
 
+// Each provider issues its own ID format; the aggregate routes IDs to the provider that owns them.
 export const accountIdSchema = z
-  .union([z.uuid(), z.string().regex(/^tl-[ac]-[A-Za-z0-9_-]{1,128}$/)])
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,140}$/)
   .describe("Opaque account ID discovered by finance_list_accounts from an active bank connection");
 
 export const countryCodeSchema = z

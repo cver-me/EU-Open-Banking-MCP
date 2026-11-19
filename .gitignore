@@ -4,7 +4,6 @@ dist/
 coverage/
 
 # Financial credentials and local configuration
-wrangler.dev-truelayer.jsonc
 .dev.vars*
 !.dev.vars.example
 .env*

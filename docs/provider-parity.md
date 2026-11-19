@@ -72,4 +72,4 @@ Status key: ✅ same as Enable Banking · 🟡 filled, but differently or partly
 7. ~~**Holder name**~~ — not needed.
 8. ~~**Consent renewal**~~ — Reconnect button and expiry warnings (extend endpoint needs TrueLayer review).
 9. ~~**Labels and docs**~~ — fixed.
-10. **Local dev**: replace the temporary `wrangler.local-test.jsonc` approach with a documented script.
+10. ~~**Local dev**~~ — providers are optional and no secrets are declared as required, so plain `bun run dev` loads whatever `.dev.vars` contains.

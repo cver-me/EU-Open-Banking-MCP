@@ -3,7 +3,7 @@ import { exportPKCS8, generateKeyPair } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { KvTrueLayerConnectionStore } from "../src/providers/truelayer/connection-store";
-import { decodeEncryptionKey, TokenCipher } from "../src/token-crypto";
+import { decodeEncryptionKey, TokenCipher } from "../src/lib/crypto";
 
 const SESSION_STORE_KEY = "enable-banking-session-ids-v1";
 const INTESA_SESSION_ID = "22222222-2222-4222-8222-222222222222";
@@ -948,5 +948,86 @@ describe("Provider isolation", () => {
       incompleteReasons: ["provider_unavailable"],
       providerErrors: [{ provider: "enable_banking" }],
     });
+  });
+});
+
+describe("Provider configurations", () => {
+  const KEY_BASE64 = btoa(String.fromCharCode(...new Uint8Array(32).fill(5)));
+  const CONNECTION_ID = "12121212-1212-4121-8121-121212121212";
+  const EU = () => ({
+    ENABLE_BANKING_APPLICATION_ID: "00000000-0000-4000-8000-000000000000",
+    ENABLE_BANKING_PRIVATE_KEY_PEM: providerPrivateKeyPem,
+  });
+  const UK = {
+    TRUELAYER_CLIENT_ID: "personalfinance-abc123",
+    TRUELAYER_CLIENT_SECRET: "test-client-secret",
+    TOKEN_ENCRYPTION_KEY: KEY_BASE64,
+  };
+  // Only SESSION_STORE is always present; provider secrets are optional.
+  const workerEnv = (vars: Record<string, string>) => ({ SESSION_STORE: env.SESSION_STORE, ...vars }) as unknown as Env;
+
+  beforeEach(async () => {
+    await env.SESSION_STORE.put(SESSION_STORE_KEY, JSON.stringify([INTESA_SESSION_ID]));
+    await new KvTrueLayerConnectionStore(env.SESSION_STORE, new TokenCipher(decodeEncryptionKey(KEY_BASE64)))
+      .put(CONNECTION_ID, {
+        refreshToken: "refresh",
+        accessToken: "access",
+        accessTokenExpiresAt: Date.now() + 3_600_000,
+        providerName: "Starling",
+        createdAt: "2026-11-19T10:00:00.000Z",
+      });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/sessions/${INTESA_SESSION_ID}`) {
+        return Response.json({
+          status: "AUTHORIZED",
+          accounts: [INTESA_ACCOUNT_ID],
+          aspsp: { name: "Intesa Sanpaolo", country: "IT" },
+          psu_type: "personal",
+        });
+      }
+      if (url.pathname === `/accounts/${INTESA_ACCOUNT_ID}/details`) {
+        return Response.json({ currency: "EUR", cash_account_type: "CACC", product: "Conto" });
+      }
+      if (url.pathname === "/data/v1/accounts") {
+        return Response.json({ results: [{ account_id: "acc1", account_type: "TRANSACTION", display_name: "Personal", currency: "GBP" }] });
+      }
+      if (url.pathname === "/data/v1/cards") return Response.json({ results: [] });
+      throw new Error(`Unexpected fetch ${url.href}`);
+    });
+  });
+  afterEach(async () => env.SESSION_STORE.delete(`truelayer-connection-v1:${CONNECTION_ID}`));
+
+  it.each([
+    { label: "EU only", vars: () => EU(), accounts: [INTESA_ACCOUNT_ID], sections: ["EU banks (Enable Banking)"] },
+    { label: "UK only", vars: () => UK, accounts: ["tl-a-acc1"], sections: ["UK banks (TrueLayer)"] },
+    { label: "both", vars: () => ({ ...EU(), ...UK }), accounts: [INTESA_ACCOUNT_ID, "tl-a-acc1"], sections: ["EU banks (Enable Banking)", "UK banks (TrueLayer)"] },
+  ])("works with $label", async ({ vars, accounts, sections }) => {
+    const toolResponse = await callTool(30, "finance_list_accounts", {}, workerEnv(vars()));
+    const { result } = await toolResponse.json() as { result: { isError?: boolean; structuredContent: { accounts: { accountId: string }[]; providerErrors?: unknown } } };
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent.accounts.map(({ accountId }) => accountId)).toEqual(accounts);
+    expect(result.structuredContent.providerErrors).toBeUndefined();
+
+    const page = await (await fetchAuthenticated(new Request("https://localhost/setup?country="), workerEnv(vars()))).text();
+    for (const section of ["EU banks (Enable Banking)", "UK banks (TrueLayer)"]) {
+      expect(page.includes(section)).toBe(sections.includes(section));
+    }
+  });
+
+  it("explains setup when no provider is configured", async () => {
+    const toolResponse = await callTool(31, "finance_list_accounts", {}, workerEnv({}));
+    const { result } = await toolResponse.json() as { result: { isError?: boolean; content: { text: string }[] } };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("Open /setup");
+
+    const page = await fetchAuthenticated(new Request("https://localhost/setup"), workerEnv({}));
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("No bank-data provider is configured");
+  });
+
+  it("refuses to start with a partly configured provider", async () => {
+    const response = await callTool(32, "finance_list_accounts", {}, workerEnv({ ...EU(), TRUELAYER_CLIENT_ID: "abc" }));
+    expect(response.status).toBe(503);
   });
 });

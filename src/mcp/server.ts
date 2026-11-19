@@ -21,8 +21,9 @@ import {
   type TransactionStatus,
   type SpendingTransaction,
 } from "../finance";
-import { Money } from "../money";
-import type { AggregateFinanceProvider } from "../providers/composite";
+import { addDays, differenceInDays, earlierDate, todayIsoDate } from "../lib/dates";
+import { Money } from "../lib/money";
+import type { AggregateFinanceProvider } from "../aggregate";
 
 const MAX_DATE_RANGE_DAYS = 366;
 const MAX_TRANSACTIONS_PER_RESULT = 200;
@@ -666,19 +667,3 @@ function base64UrlDecode(value: string): string {
   return new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
 }
 
-function differenceInDays(from: string, to: string): number {
-  return (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000;
-}
-
-function addDays(date: string, days: number): string {
-  const timestamp = Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000;
-  return new Date(timestamp).toISOString().slice(0, 10);
-}
-
-function earlierDate(first: string, second: string): string {
-  return first < second ? first : second;
-}
-
-function todayIsoDate(): string {
-  return new Date().toISOString().slice(0, 10);
-}

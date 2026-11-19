@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MAX_PROVIDER_AMOUNT_LENGTH } from "../../money";
+import { MAX_PROVIDER_AMOUNT_LENGTH } from "../../lib/money";
 
 export const MAX_TRUELAYER_ACCOUNTS = 20;
 const MAX_TRANSACTIONS_PER_RESPONSE = 5_000;

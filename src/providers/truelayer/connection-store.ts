@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { TokenCipher } from "../../token-crypto";
+import type { TokenCipher } from "../../lib/crypto";
 
 // Each connection is its own KV entry so concurrent token refreshes for one bank
 // never overwrite another connection's record.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import Decimal from "decimal.js";
-import { Money, MAX_PROVIDER_AMOUNT_LENGTH } from "../src/money";
+import { Money, MAX_PROVIDER_AMOUNT_LENGTH } from "../src/lib/money";
 import { transactionsSchema } from "../src/providers/enable-banking/schemas";
 
 describe("Exact financial arithmetic", () => {

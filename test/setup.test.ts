@@ -1,25 +1,46 @@
 import { exportPKCS8, generateKeyPair } from "jose";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import type { AppConfig } from "../src/config";
+import { EnableBankingClient } from "../src/providers/enable-banking/client";
+import type { EnableBankingConfig } from "../src/providers/enable-banking/config";
+import { EnableBankingSetup } from "../src/providers/enable-banking/setup";
+import { TrueLayerClient } from "../src/providers/truelayer/client";
+import type { TrueLayerConfig } from "../src/providers/truelayer/config";
+import { TrueLayerSetup } from "../src/providers/truelayer/setup";
+import type { BankProvider } from "../src/providers/types";
 import type {
   TrueLayerConnectionRecord,
   TrueLayerConnectionStore,
 } from "../src/providers/truelayer/connection-store";
-import type { SessionStore } from "../src/session-store";
+import type { SessionStore } from "../src/providers/enable-banking/session-store";
 import { handleSetupRequest } from "../src/setup";
 
 const SESSION_ID = "22222222-2222-4222-8222-222222222222";
-let config: AppConfig;
+let config: EnableBankingConfig;
+const trueLayerConfig: TrueLayerConfig = {
+  clientId: "personalfinance-abc123",
+  clientSecret: "test-client-secret",
+  tokenEncryptionKey: new Uint8Array(32),
+  sandbox: false,
+};
 
 beforeAll(async () => {
   const { privateKey } = await generateKeyPair("RS256", { extractable: true });
   config = {
-    enableBanking: {
-      applicationId: "00000000-0000-4000-8000-000000000000",
-      privateKeyPem: await exportPKCS8(privateKey),
-    },
+    applicationId: "00000000-0000-4000-8000-000000000000",
+    privateKeyPem: await exportPKCS8(privateKey),
   };
 });
+
+// Real setup adapters over injected stores; reads are not exercised here.
+function enableBanking(sessions: SessionStore): BankProvider {
+  const client = new EnableBankingClient(config, sessions);
+  return { name: "enable_banking", ownsAccountId: () => false, reader: () => client, setup: new EnableBankingSetup(client) };
+}
+
+function trueLayer(store: TrueLayerConnectionStore): BankProvider {
+  const client = new TrueLayerClient(trueLayerConfig, store);
+  return { name: "truelayer", ownsAccountId: () => false, reader: () => client, setup: new TrueLayerSetup(trueLayerConfig, client) };
+}
 
 describe("protected setup flow", () => {
   it("lists banks returned for the selected country and account type", async () => {
@@ -39,8 +60,7 @@ describe("protected setup flow", () => {
 
     const response = await handleSetupRequest(
       new Request("https://finance.example/setup?country=it&psuType=business"),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
 
     expect(response?.status).toBe(200);
@@ -96,8 +116,7 @@ describe("protected setup flow", () => {
         },
         body: "institution=Example+Bank&country=it&psuType=personal",
       }),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
     expect(connectResponse?.status).toBe(200);
     expect(await connectResponse?.text()).toContain(
@@ -112,8 +131,7 @@ describe("protected setup flow", () => {
         `https://finance.example/callback?code=one-time-code&state=${authorizationState}`,
         { headers: { Cookie: cookie ?? "" } },
       ),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
     expect(callbackResponse?.status).toBe(303);
     expect(callbackResponse?.headers.get("Location")).toBe("/setup?connected=1");
@@ -136,8 +154,7 @@ describe("protected setup flow", () => {
         },
         body: "institution=Example+Bank&country=IT&psuType=personal",
       }),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
     expect(response?.status).toBe(400);
     expect(await response?.text()).toContain("Invalid setup request origin");
@@ -175,8 +192,7 @@ describe("protected setup flow", () => {
         },
         body: "institution=Example+Bank&country=IT&psuType=personal",
       }),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
 
     expect(response?.status).toBe(200);
@@ -203,8 +219,7 @@ describe("protected setup flow", () => {
         },
         body: "institution=Example+Bank&country=IT&psuType=personal",
       }),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
 
     expect(response?.status).toBe(400);
@@ -217,15 +232,6 @@ describe("TrueLayer setup flow", () => {
     list: vi.fn(async () => []),
     add: vi.fn(async () => undefined),
     remove: vi.fn(async () => undefined),
-  });
-  const trueLayerConfig = (): AppConfig => ({
-    ...config,
-    trueLayer: {
-      clientId: "personalfinance-abc123",
-      clientSecret: "test-client-secret",
-      tokenEncryptionKey: new Uint8Array(32),
-      sandbox: false,
-    },
   });
   const memoryStore = (): TrueLayerConnectionStore & { records: Map<string, TrueLayerConnectionRecord> } => {
     const records = new Map<string, TrueLayerConnectionRecord>();
@@ -244,9 +250,7 @@ describe("TrueLayer setup flow", () => {
         method: "POST",
         headers: { Origin: "https://finance.example" },
       }),
-      trueLayerConfig(),
-      emptySessions(),
-      store,
+      [enableBanking(emptySessions()), trueLayer(store)],
     );
     expect(connect?.status).toBe(200);
     const cookie = connect?.headers.get("Set-Cookie") ?? "";
@@ -270,9 +274,7 @@ describe("TrueLayer setup flow", () => {
       new Request(`https://finance.example/callback/truelayer?code=abc&state=${crypto.randomUUID()}`, {
         headers: { Cookie: cookie.split(";")[0]! },
       }),
-      trueLayerConfig(),
-      emptySessions(),
-      store,
+      [enableBanking(emptySessions()), trueLayer(store)],
     );
     expect(mismatched?.status).toBe(400);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -281,9 +283,7 @@ describe("TrueLayer setup flow", () => {
       new Request(`https://finance.example/callback/truelayer?code=abc&state=${state}`, {
         headers: { Cookie: cookie.split(";")[0]! },
       }),
-      trueLayerConfig(),
-      emptySessions(),
-      store,
+      [enableBanking(emptySessions()), trueLayer(store)],
     );
     expect(callback?.status).toBe(303);
     expect(callback?.headers.get("Location")).toBe("/setup?connected=1");
@@ -306,7 +306,7 @@ describe("TrueLayer setup flow", () => {
         headers: { Origin: "https://finance.example", "Content-Type": "application/x-www-form-urlencoded" },
         body: `replaceConnectionId=${OLD}`,
       }),
-      trueLayerConfig(), emptySessions(), store,
+      [enableBanking(emptySessions()), trueLayer(store)],
     );
     const cookie = connect!.headers.get("Set-Cookie")!.split(";")[0]!;
     const [state] = decodeURIComponent(cookie.split("=")[1]!).split(".");
@@ -320,7 +320,7 @@ describe("TrueLayer setup flow", () => {
 
     const callback = await handleSetupRequest(
       new Request(`https://finance.example/callback/truelayer?code=abc&state=${state}`, { headers: { Cookie: cookie } }),
-      trueLayerConfig(), emptySessions(), store,
+      [enableBanking(emptySessions()), trueLayer(store)],
     );
 
     expect(callback?.headers.get("Location")).toBe(location);
@@ -339,7 +339,7 @@ describe("TrueLayer setup flow", () => {
       refreshToken: "r", providerName: "Monzo", createdAt: "2026-05-01T10:00:00.000Z", consentExpiresAt: "2026-07-30T10:00:00Z",
     });
     const response = await handleSetupRequest(
-      new Request("https://finance.example/setup?country="), trueLayerConfig(), emptySessions(), store,
+      new Request("https://finance.example/setup?country="), [enableBanking(emptySessions()), trueLayer(store)],
     );
     const body = await response!.text();
     expect(body).toMatch(/Starling — connected 2026-08-21 — consent expires in [45] day\(s\): reconnect soon/);
@@ -347,17 +347,15 @@ describe("TrueLayer setup flow", () => {
     expect(body.match(/name="replaceConnectionId"/g)).toHaveLength(2);
   });
 
-  it("refuses TrueLayer routes when TrueLayer is not configured", async () => {
+  it("leaves TrueLayer routes unhandled when TrueLayer is not configured", async () => {
     const response = await handleSetupRequest(
       new Request("https://finance.example/setup/truelayer/connect", {
         method: "POST",
         headers: { Origin: "https://finance.example" },
       }),
-      config,
-      emptySessions(),
+      [enableBanking(emptySessions())],
     );
-    expect(response?.status).toBe(400);
-    expect(await response?.text()).toContain("TrueLayer is not configured");
+    expect(response).toBeUndefined();
   });
 });
 
@@ -372,8 +370,7 @@ describe("setup page resilience", () => {
 
     const response = await handleSetupRequest(
       new Request("https://finance.example/setup?country=GB&psuType=personal"),
-      config,
-      sessions,
+      [enableBanking(sessions)],
     );
 
     expect(response?.status).toBe(200);

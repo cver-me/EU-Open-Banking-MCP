@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { enableBankingPsuHeadersFromRequest } from "../src/providers/enable-banking/psu-headers";
+import { psuContextFromRequest } from "../src/lib/psu";
+import { enableBankingPsuHeaders } from "../src/providers/enable-banking/psu-headers";
+
+const enableBankingPsuHeadersFromRequest = (request: Request) => enableBankingPsuHeaders(psuContextFromRequest(request));
 
 describe("Enable Banking PSU headers", () => {
   it("derives the documented online-user headers from the MCP request", () => {

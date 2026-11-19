@@ -34,8 +34,8 @@ flowchart LR
   C[ChatGPT, Codex, or another MCP client] --> A[Cloudflare Access]
   A -->|platform-validated ctx.access| W[Stateless MCP Worker]
   W -->|session IDs, encrypted TrueLayer tokens| K[Workers KV]
-  W -->|request-scoped RS256 JWT| E[Enable Banking]
-  W -.->|optional: OAuth access token| T[TrueLayer]
+  W -.->|optional, EU: request-scoped RS256 JWT| E[Enable Banking]
+  W -.->|optional, UK: OAuth access token| T[TrueLayer]
   E --> B[Your EU bank]
   T --> U[Your UK bank]
 ```
@@ -79,6 +79,17 @@ For a complete balance refresh, call `finance_get_balances` once without an `acc
 all active sessions itself, so a preceding `finance_list_accounts` call is unnecessary. The response
 keeps successful balances when another account fails and reports safe per-account errors separately.
 Do not immediately retry accounts reporting `aspsp_rate_limited`.
+
+## Choosing providers
+
+Each provider is optional. Configure EU banks, UK banks, or both:
+
+| Provider | Banks | Worker secrets (set all of them, or none) |
+| --- | --- | --- |
+| Enable Banking | EEA banks | `ENABLE_BANKING_APPLICATION_ID`, `ENABLE_BANKING_PRIVATE_KEY_PEM` |
+| TrueLayer | UK banks | `TRUELAYER_CLIENT_ID`, `TRUELAYER_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY` |
+
+The tools and `/setup` show only the configured providers. With none configured, `/setup` lists the secrets to set and the tools answer `setup_required`. A partly configured provider (for example, a client ID without its secret) stops the Worker with `503` so a typo cannot silently disable a provider. For a UK-only deployment, skip the Enable Banking steps below and follow [UK banks through TrueLayer](#4b-optional-uk-banks-through-truelayer).
 
 ## Installation
 
@@ -222,10 +233,10 @@ bun run test
 bun run check
 ```
 
-To try TrueLayer locally, put its three values in `.dev.vars`, register `http://localhost:8787/callback/truelayer` in TrueLayer Console, and run `bun run dev:truelayer`. Plain `wrangler dev` ignores the TrueLayer values because it only loads `.dev.vars` secrets listed in `secrets.required`; the script runs it with a gitignored config copy that lists them. Deployed Workers keep secrets set with `wrangler secret put` either way.
+For local development, put the secrets of the providers you use in `.dev.vars` and run `bun run dev`. To test TrueLayer locally, also register `http://localhost:8787/callback/truelayer` in TrueLayer Console. Generated Worker types come from `.dev.vars.example`, so they don't depend on your local secrets.
 
-Tests run in the Cloudflare Workers runtime and cover configuration, Access fail-closed behavior, setup authorization, session discovery, account enforcement, MCP tool schemas, Enable Banking JWT construction, normalization, and bounded responses.
+Tests run in the Cloudflare Workers runtime and cover every provider configuration (EU only, UK only, both, none, partial), Access fail-closed behavior, setup authorization, session discovery, account enforcement, MCP tool schemas, Enable Banking JWT construction, normalization, and bounded responses.
 
 ## Provider scope
 
-Enable Banking (EU) and TrueLayer (UK) implement the same `FinanceProvider` interface, and a composite provider routes account IDs to the right one. Future providers should expose the same narrow normalized finance interface rather than leaking generic provider HTTP operations into MCP tools. Contributions must remain read-only from MCP and include tests for identifier validation and response normalization.
+Each provider is one module under `src/providers/<name>/` that implements `BankProvider` (`src/providers/types.ts`): a name, `ownsAccountId`, a request-scoped `reader` for the six tools, and a `setup` part for `/setup` routes and its page section. `src/providers/registry.ts` is the only place that reads provider secrets; `src/aggregate.ts` combines the configured readers and routes account IDs to their owner. Adding a provider means adding a folder and one line in the registry. Future providers should expose the same narrow normalized finance interface rather than leaking generic provider HTTP operations into MCP tools. Contributions must remain read-only from MCP and include tests for identifier validation and response normalization.

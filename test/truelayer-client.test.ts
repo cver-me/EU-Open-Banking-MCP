@@ -1,8 +1,6 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadConfig, type TrueLayerConfig } from "../src/config";
-import { PublicError } from "../src/errors";
-import { CompositeFinanceProvider } from "../src/providers/composite";
+import type { TrueLayerConfig } from "../src/providers/truelayer/config";
 import { TrueLayerClient, trueLayerAuthorizationUrl, ukLocalDate } from "../src/providers/truelayer/client";
 import {
   KvTrueLayerConnectionStore,
@@ -10,8 +8,7 @@ import {
   type TrueLayerConnectionRecord,
   type TrueLayerConnectionStore,
 } from "../src/providers/truelayer/connection-store";
-import type { FinanceProvider } from "../src/providers/types";
-import { decodeEncryptionKey, TokenCipher } from "../src/token-crypto";
+import { decodeEncryptionKey, TokenCipher } from "../src/lib/crypto";
 
 const KEY_BASE64 = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
 const CONNECTION_ID = "66666666-6666-4666-8666-666666666666";
@@ -104,30 +101,6 @@ describe("token encryption", () => {
   });
 });
 
-describe("TrueLayer configuration", () => {
-  const base = {
-    ENABLE_BANKING_APPLICATION_ID: "00000000-0000-4000-8000-000000000000",
-    ENABLE_BANKING_PRIVATE_KEY_PEM: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----",
-  } as Env;
-
-  it("is optional", () => {
-    expect(loadConfig(base).trueLayer).toBeUndefined();
-  });
-
-  it("rejects a partial configuration", () => {
-    expect(() => loadConfig({ ...base, TRUELAYER_CLIENT_ID: "abc" } as Env)).toThrow();
-  });
-
-  it("detects sandbox client IDs", () => {
-    const loaded = loadConfig({
-      ...base,
-      TRUELAYER_CLIENT_ID: "sandbox-abc",
-      TRUELAYER_CLIENT_SECRET: "secret",
-      TOKEN_ENCRYPTION_KEY: KEY_BASE64,
-    } as Env);
-    expect(loaded.trueLayer?.sandbox).toBe(true);
-  });
-});
 
 describe("KvTrueLayerConnectionStore", () => {
   it("stores only encrypted records", async () => {
@@ -483,58 +456,3 @@ describe("TrueLayerClient", () => {
   });
 });
 
-describe("CompositeFinanceProvider", () => {
-  const provider = (overrides: Partial<FinanceProvider>): FinanceProvider => ({
-    listAccounts: vi.fn(async () => []),
-    getBalances: vi.fn(async () => ({ balances: [], errors: [] })),
-    listTransactions: vi.fn(async () => ({ transactions: [] })),
-    listAccountIds: vi.fn(async () => []),
-    ...overrides,
-  });
-  const setupRequired = () => Promise.reject(new PublicError("setup", "setup_required"));
-
-  it("ignores a provider with no connected banks", async () => {
-    const composite = new CompositeFinanceProvider(
-      provider({ listAccountIds: setupRequired }),
-      provider({ listAccountIds: async () => ["tl-a-acc123"] }),
-    );
-    await expect(composite.listAccountIds()).resolves.toEqual({ value: ["tl-a-acc123"], providerErrors: [] });
-  });
-
-  it("keeps one provider's accounts when the other fails", async () => {
-    const composite = new CompositeFinanceProvider(
-      provider({ listAccountIds: () => Promise.reject(new PublicError("Enable Banking timed out.", "provider_timeout")) }),
-      provider({ listAccountIds: async () => ["tl-a-acc123"] }),
-    );
-    await expect(composite.listAccountIds()).resolves.toEqual({
-      value: ["tl-a-acc123"],
-      providerErrors: [{ provider: "enable_banking", code: "provider_timeout", message: "Enable Banking timed out." }],
-    });
-  });
-
-  it("fails when every provider fails, without hiding the real error behind setup_required", async () => {
-    const composite = new CompositeFinanceProvider(
-      provider({ listAccountIds: setupRequired }),
-      provider({ listAccountIds: () => Promise.reject(new PublicError("TrueLayer timed out.", "provider_timeout")) }),
-    );
-    await expect(composite.listAccountIds()).rejects.toMatchObject({ code: "provider_timeout" });
-  });
-
-  it("requires setup only when no provider has banks", async () => {
-    const composite = new CompositeFinanceProvider(
-      provider({ listAccountIds: setupRequired }),
-      provider({ listAccountIds: setupRequired }),
-    );
-    await expect(composite.listAccountIds()).rejects.toMatchObject({ code: "setup_required" });
-  });
-
-  it("routes account reads by ID prefix", async () => {
-    const enableBanking = provider({});
-    const trueLayer = provider({});
-    const composite = new CompositeFinanceProvider(enableBanking, trueLayer);
-    await composite.listTransactions("tl-a-acc123", {});
-    await composite.listTransactions("11111111-1111-4111-8111-111111111111", {});
-    expect(trueLayer.listTransactions).toHaveBeenCalledWith("tl-a-acc123", {});
-    expect(enableBanking.listTransactions).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111", {});
-  });
-});

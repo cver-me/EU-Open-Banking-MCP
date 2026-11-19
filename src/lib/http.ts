@@ -1,4 +1,4 @@
-import { PublicError } from "./errors";
+import { PublicError } from "../errors";
 
 const MAX_UPSTREAM_BYTES = 1_000_000;
 

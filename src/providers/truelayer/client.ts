@@ -1,6 +1,5 @@
 import type { z } from "zod";
-import type { TrueLayerConfig } from "../../config";
-import { errorMessage, PublicError } from "../../errors";
+import { PublicError } from "../../errors";
 import type {
   AccountReadError,
   AccountSummary,
@@ -9,9 +8,20 @@ import type {
   Transaction,
   TransactionPage,
 } from "../../finance";
-import { readBoundedJson } from "../../http";
-import { Money } from "../../money";
-import type { BalanceReadResult, FinanceProvider, PsuContext, TransactionQuery } from "../types";
+import { readBoundedJson } from "../../lib/http";
+import { addDays, laterDate, todayIsoDate } from "../../lib/dates";
+import { Money } from "../../lib/money";
+import {
+  accountReadError,
+  isBankRateLimit,
+  optionalText,
+  parseProviderResponse as sharedParseProviderResponse,
+  providerTimeout as sharedProviderTimeout,
+  setupRequired,
+  unknownAccount,
+} from "../shared";
+import type { BalanceReadResult, FinanceReader, PsuContext, TransactionQuery } from "../types";
+import type { TrueLayerConfig } from "./config";
 import {
   MAX_TRUELAYER_CONNECTIONS,
   type TrueLayerConnection,
@@ -31,6 +41,7 @@ import {
   type TrueLayerTransaction,
 } from "./schemas";
 
+const PROVIDER_LABEL = "TrueLayer";
 const REQUEST_TIMEOUT_MS = 10_000;
 const ACCESS_TOKEN_SAFETY_MARGIN_MS = 60_000;
 const DEFAULT_HISTORY_DAYS = 90;
@@ -68,9 +79,6 @@ export interface TrueLayerConnectionSummary {
   createdAt: string;
 }
 
-export function isTrueLayerAccountId(accountId: string): boolean {
-  return accountId.startsWith("tl-");
-}
 
 export function trueLayerAuthorizationUrl(
   config: TrueLayerConfig,
@@ -92,7 +100,7 @@ export function trueLayerAuthorizationUrl(
   return url.toString();
 }
 
-export class TrueLayerClient implements FinanceProvider {
+export class TrueLayerClient implements FinanceReader {
   private connectionsPromise: Promise<TrueLayerConnection[]> | undefined;
   private accountsPromise: Promise<AuthorizedAccount[]> | undefined;
   private readonly accessTokens = new Map<string, Promise<string>>();
@@ -138,10 +146,10 @@ export class TrueLayerClient implements FinanceProvider {
           try {
             balances.push(...(await this.accountBalances(account)));
           } catch (error) {
-            errors.push(accountReadError(account, error));
-            if (error instanceof PublicError && error.code === "aspsp_rate_limited") {
+            errors.push(accountReadError({ ...account, country: "GB" }, error));
+            if (isBankRateLimit(error)) {
               // Further reads at the same bank would hit the same limit.
-              for (const skipped of group.slice(index + 1)) errors.push(accountReadError(skipped, error));
+              for (const skipped of group.slice(index + 1)) errors.push(accountReadError({ ...skipped, country: "GB" }, error));
               break;
             }
           }
@@ -589,18 +597,11 @@ function dataOperation(path: string): string {
 }
 
 function parseProviderResponse<T extends z.ZodType>(schema: T, value: unknown, operation: string): z.output<T> {
-  const parsed = schema.safeParse(value);
-  if (parsed.success) return parsed.data;
-  console.error(JSON.stringify({
-    message: "TrueLayer response validation failed",
-    operation,
-    issueCount: parsed.error.issues.length,
-    issues: parsed.error.issues.slice(0, 10).map((issue) => ({
-      code: issue.code,
-      path: issue.path.map(String).join("."),
-    })),
-  }));
-  throw new PublicError("TrueLayer returned unsupported account data.", "provider_response_invalid");
+  return sharedParseProviderResponse(schema, value, { providerLabel: PROVIDER_LABEL, operation, dataKind: "account" });
+}
+
+function providerTimeout(): PublicError {
+  return sharedProviderTimeout(PROVIDER_LABEL);
 }
 
 async function providerError(response: Response, operation: string): Promise<PublicError> {
@@ -765,15 +766,6 @@ function parseContinuationKey(key: string, dateFrom: string, dateTo: string): st
   return date;
 }
 
-function accountReadError(account: AuthorizedAccount, error: unknown): AccountReadError {
-  return {
-    accountId: account.accountId,
-    institution: account.institution,
-    country: "GB",
-    code: error instanceof PublicError ? error.code : "provider_error",
-    message: errorMessage(error),
-  };
-}
 
 function decimal(value: number): string {
   return new Money(value).toFixed();
@@ -784,36 +776,9 @@ function isoDatePrefix(value: string | undefined): string | undefined {
   return date !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined;
 }
 
-function optionalText(value: string | null | undefined): string | undefined {
-  return value?.trim() || undefined;
-}
 
-function addDays(date: string, days: number): string {
-  return new Date(Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000).toISOString().slice(0, 10);
-}
 
-function laterDate(first: string, second: string): string {
-  return first > second ? first : second;
-}
 
-function todayIsoDate(): string {
-  return new Date().toISOString().slice(0, 10);
-}
 
-function providerTimeout(): PublicError {
-  return new PublicError("TrueLayer timed out. Try again shortly.", "provider_timeout");
-}
 
-function setupRequired(): PublicError {
-  return new PublicError(
-    "No active bank authorization is available. Open /setup to connect or renew a bank.",
-    "setup_required",
-  );
-}
 
-function unknownAccount(): PublicError {
-  return new PublicError(
-    "Unknown or inactive account ID. Call finance_list_accounts again.",
-    "unknown_account",
-  );
-}
