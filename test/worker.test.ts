@@ -373,7 +373,7 @@ describe("Worker boundary", () => {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
-      totalsByCurrency: { EUR: "3.7" },
+      totalsByCurrency: { EUR: "3.70" },
       transactions: [
         {
           accountId: REVOLUT_ACCOUNT_ID,
@@ -391,7 +391,7 @@ describe("Worker boundary", () => {
       transactionDetailsComplete: true,
       complete: false,
       pagesScanned: 2,
-      totalsByStatus: { booked: {}, pending: { EUR: "3.7" }, held: {} },
+      totalsByStatus: { booked: {}, pending: { EUR: "3.70" }, held: {} },
       incompleteReasons: ["inferred_dates"],
     });
     expect(JSON.stringify(payload)).not.toContain("Licari Group");
@@ -443,7 +443,7 @@ describe("Worker boundary", () => {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
-      totalsByCurrency: { EUR: "5" },
+      totalsByCurrency: { EUR: "5.00" },
       transactions: [
         {
           accountId: INTESA_ACCOUNT_ID,
@@ -460,7 +460,7 @@ describe("Worker boundary", () => {
       transactionDetailsComplete: true,
       complete: false,
       pagesScanned: 1,
-      totalsByStatus: { booked: { EUR: "5" }, pending: {}, held: {} },
+      totalsByStatus: { booked: { EUR: "5.00" }, pending: {}, held: {} },
       incompleteReasons: ["inferred_dates"],
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -524,7 +524,7 @@ describe("Worker boundary", () => {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toMatchObject({
-      totalsByCurrency: { EUR: "12" },
+      totalsByCurrency: { EUR: "12.00" },
       transactionsIncluded: 2,
       transactionDetailsComplete: true,
       complete: false,
@@ -589,7 +589,7 @@ describe("Worker boundary", () => {
       result: { structuredContent: Record<string, unknown> };
     };
     expect(payload.result.structuredContent).toEqual({
-      totalsByCurrency: { EUR: { credit: "5", debit: "2", net: "3" } },
+      totalsByCurrency: { EUR: { credit: "5.00", debit: "2.00", net: "3.00" } },
       incompleteReasons: [],
       transactionsIncluded: 2,
       complete: true,
@@ -735,7 +735,7 @@ describe("Finance scan regressions", () => {
       if (name === "finance_summarize_cash_flow") {
         expect(result.structuredContent).toMatchObject({
           transactionsIncluded: 2,
-          totalsByCurrency: { EUR: { credit: "0", debit: "0.02", net: "-0.02" } },
+          totalsByCurrency: { EUR: { credit: "0.00", debit: "0.02", net: "-0.02" } },
         });
       } else {
         expect(result.structuredContent.transactions).toHaveLength(2);
@@ -757,7 +757,7 @@ describe("Finance scan regressions", () => {
       incompleteReasons: more ? ["transaction_limit"] : [],
       pagesScanned: 2,
       transactionsIncluded: 10_000,
-      totalsByCurrency: { EUR: { credit: "0", debit: "100", net: "-100" } },
+      totalsByCurrency: { EUR: { credit: "0.00", debit: "100.00", net: "-100.00" } },
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
@@ -789,8 +789,8 @@ describe("Finance scan regressions", () => {
     const { result } = await invoke("finance_get_spending", { includeTransactions: true });
     expect(result.structuredContent).toMatchObject({
       complete: false,
-      totalsByCurrency: { EUR: "19" },
-      totalsByStatus: { booked: { EUR: "12" }, held: { EUR: "3" }, pending: { EUR: "4" } },
+      totalsByCurrency: { EUR: "19.00" },
+      totalsByStatus: { booked: { EUR: "12.00" }, held: { EUR: "3.00" }, pending: { EUR: "4.00" } },
       transactionsIncluded: 4,
       incompleteReasons: ["inferred_dates", "unknown_status", "missing_dates"],
     });
@@ -824,7 +824,7 @@ describe("Finance scan regressions", () => {
       transactionDetailsComplete: boolean;
     };
     expect(concise).toEqual(summary);
-    expect(concise).toMatchObject({ totalsByCurrency: { EUR: "0.2" }, complete: false, incompleteReasons: ["inferred_dates"] });
+    expect(concise).toMatchObject({ totalsByCurrency: { EUR: "0.20" }, complete: false, incompleteReasons: ["inferred_dates"] });
     expect(concise).not.toHaveProperty("transactions");
     expect(concise).not.toHaveProperty("providerDateRange");
     expect(transactions).toHaveLength(20);
@@ -943,7 +943,7 @@ describe("Provider isolation", () => {
       dateFrom: "2026-11-01", dateTo: "2026-11-19",
     });
     expect(result.structuredContent).toMatchObject({
-      totalsByCurrency: { GBP: { credit: "0", debit: "12.5", net: "-12.5" } },
+      totalsByCurrency: { GBP: { credit: "0.00", debit: "12.50", net: "-12.50" } },
       complete: false,
       incompleteReasons: ["provider_unavailable"],
       providerErrors: [{ provider: "enable_banking" }],
@@ -1013,6 +1013,37 @@ describe("Provider configurations", () => {
     for (const section of ["EU banks (Enable Banking)", "UK banks (TrueLayer)"]) {
       expect(page.includes(section)).toBe(sections.includes(section));
     }
+  });
+
+  it("keeps each account's own currency and formats amounts by that currency", async () => {
+    // An EU bank with a GBP account and a UK bank with a EUR account.
+    vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/sessions/${INTESA_SESSION_ID}`) {
+        return Response.json({ status: "AUTHORIZED", accounts: [INTESA_ACCOUNT_ID], aspsp: { name: "Revolut", country: "IT" }, psu_type: "personal" });
+      }
+      if (url.pathname === `/accounts/${INTESA_ACCOUNT_ID}/details`) return Response.json({ currency: "GBP", cash_account_type: "CACC" });
+      if (url.pathname === `/accounts/${INTESA_ACCOUNT_ID}/balances`) {
+        return Response.json({ balances: [{ name: "Available", balance_amount: { amount: "250", currency: "GBP" }, balance_type: "ITAV" }] });
+      }
+      if (url.pathname === "/data/v1/accounts") return Response.json({ results: [{ account_id: "eur1", account_type: "TRANSACTION", display_name: "Euro", currency: "EUR" }] });
+      if (url.pathname === "/data/v1/cards") return Response.json({ results: [] });
+      if (url.pathname === "/data/v1/accounts/eur1/balance") return Response.json({ results: [{ currency: "EUR", current: 12.5 }] });
+      throw new Error(`Unexpected fetch ${url.href}`);
+    });
+    const vars = workerEnv({ ...EU(), ...UK });
+
+    const accounts = await (await callTool(33, "finance_list_accounts", {}, vars)).json() as { result: { structuredContent: { accounts: { accountId: string; country: string; currency: string }[] } } };
+    expect(accounts.result.structuredContent.accounts.map(({ country, currency }) => ({ country, currency }))).toEqual([
+      { country: "IT", currency: "GBP" },
+      { country: "GB", currency: "EUR" },
+    ]);
+
+    const balances = await (await callTool(34, "finance_get_balances", {}, vars)).json() as { result: { structuredContent: { balances: { currency: string; amount: string }[] } } };
+    expect(balances.result.structuredContent.balances.map(({ currency, amount }) => ({ currency, amount }))).toEqual([
+      { currency: "GBP", amount: "250.00" },
+      { currency: "EUR", amount: "12.50" },
+    ]);
   });
 
   it("explains setup when no provider is configured", async () => {

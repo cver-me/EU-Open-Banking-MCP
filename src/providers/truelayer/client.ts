@@ -10,7 +10,7 @@ import {
   type TransactionPage,
 } from "../../finance";
 import { addDays, laterDate, todayIsoDate } from "../../lib/dates";
-import { Money } from "../../lib/money";
+import { formatAmount, Money } from "../../lib/money";
 import type { PsuContext } from "../../lib/psu";
 import {
   bankRateLimited,
@@ -405,7 +405,7 @@ export class TrueLayerClient implements FinanceReader {
         institution: account.institution,
         country: account.country,
         currency,
-        amount: decimal(amount),
+        amount: formatAmount(amount, currency),
         balanceType,
         label,
         ...(referenceDate === undefined ? {} : { referenceDate }),
@@ -595,7 +595,7 @@ function normalizeTransaction(
   return {
     accountId,
     // Account amounts are signed but card amounts are not; transaction_type is authoritative.
-    amount: new Money(transaction.amount).abs().toFixed(),
+    amount: formatAmount(new Money(transaction.amount).abs(), transaction.currency),
     currency: transaction.currency,
     direction: credit ? "credit" : "debit",
     status,
@@ -671,9 +671,6 @@ function parseContinuationKey(key: string, dateFrom: string, dateTo: string): st
   return date;
 }
 
-function decimal(value: number): string {
-  return new Money(value).toFixed();
-}
 
 function isoDatePrefix(value: string | undefined): string | undefined {
   const date = value?.slice(0, 10);

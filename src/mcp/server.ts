@@ -23,7 +23,7 @@ import {
 } from "../finance";
 import { base64UrlDecode, base64UrlEncode } from "../lib/crypto";
 import { addDays, differenceInDays, earlierDate, todayIsoDate } from "../lib/dates";
-import { Money } from "../lib/money";
+import { formatAmount, Money } from "../lib/money";
 import type { Aggregate } from "../aggregate";
 
 const MAX_DATE_RANGE_DAYS = 366;
@@ -120,7 +120,7 @@ export function createFinanceServer(provider: Aggregate): McpServer {
     {
       title: "List financial accounts",
       description:
-        "Discover accounts from every active bank connection and return opaque account IDs with bank-provided metadata. Never returns IBANs or account numbers. If a data provider cannot be read, its accounts are missing and providerErrors says which.",
+        "Discover accounts from every active bank connection and return opaque account IDs with bank-provided metadata, including each account's own currency (a bank's country does not imply it). Never returns IBANs or account numbers. If a data provider cannot be read, its accounts are missing and providerErrors says which.",
       inputSchema: z.object({}),
       outputSchema: z.object({ accounts: z.array(accountSummarySchema), providerErrors: providerErrorsSchema }),
       annotations,
@@ -265,7 +265,7 @@ export function createFinanceServer(provider: Aggregate): McpServer {
         if (providerErrors.length > 0) incompleteReasons.add("provider_unavailable");
         return {
           totalsByCurrency: Object.fromEntries(
-            [...totals.entries()].map(([currency, total]) => [currency, total.toFixed()]),
+            [...totals.entries()].map(([currency, total]) => [currency, formatAmount(total, currency)]),
           ),
           ...(includeTransactions ? {
             transactions,
@@ -275,7 +275,7 @@ export function createFinanceServer(provider: Aggregate): McpServer {
           complete: incompleteReasons.size === 0,
           pagesScanned: scan.pagesScanned,
           totalsByStatus: Object.fromEntries(Object.entries(statusTotals).map(([status, byCurrency]) => [
-            status, Object.fromEntries([...byCurrency].map(([currency, total]) => [currency, total.toFixed()])),
+            status, Object.fromEntries([...byCurrency].map(([currency, total]) => [currency, formatAmount(total, currency)])),
           ])),
           incompleteReasons: [...incompleteReasons],
           ...withProviderErrors(providerErrors),
@@ -495,9 +495,9 @@ export function createFinanceServer(provider: Aggregate): McpServer {
           [...totals.entries()].map(([currency, value]) => [
             currency,
             {
-              credit: value.credit.toFixed(),
-              debit: value.debit.toFixed(),
-              net: value.credit.minus(value.debit).toFixed(),
+              credit: formatAmount(value.credit, currency),
+              debit: formatAmount(value.debit, currency),
+              net: formatAmount(value.credit.minus(value.debit), currency),
             },
           ]),
         );

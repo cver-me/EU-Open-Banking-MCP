@@ -48,6 +48,8 @@ No-date entries cannot be placed inside a requested interval, especially when th
 - Provider date filters use the bank's semantics. Seven-day padding is a retrieval heuristic, not a guarantee against long posting delays.
 - MCP cursors bind account and filters but do not create snapshots. Continuing a sliced page re-reads live provider data; clients should restart if the underlying data changes.
 - Amounts remain strings. Provider inputs allow at most 100 characters; a separate Decimal constructor supplies enough precision for mixed scales and at most 10,000 included records. Currencies are never converted or combined.
+- Every amount the tools return (balances, transactions, spending and cash-flow totals, for every provider) has at least its currency's ISO 4217 minor-unit digits: `"9000.00"` GBP, `"1500"` JPY, `"1.500"` KWD. Extra digits a bank reports are kept, never rounded, and zero is never signed.
+- Every account has its own `currency`, and every balance and transaction states the currency of its amount. A bank's country does not imply the currency: a UK bank can hold a EUR account and an EU bank a GBP account.
 
 These rules are exercised with synthetic provider fixtures and Worker-level MCP calls. Live smoke tests must keep account identifiers and financial payloads out of repository fixtures and reports.
 
@@ -75,5 +77,5 @@ TrueLayer Data API v1 responses are converted into the same tool schemas. Differ
 - **Refused history**: when a window fails with `sca_exceeded`, paging stops with `historyUnavailable: true` instead of failing the tool. Scans report `history_unavailable`. Banks that return empty results instead cannot be detected.
 - **Statuses**: only `booked` (settled) and `pending` exist. Filters for other statuses return no records.
 - **Not available from TrueLayer** (left empty rather than invented): account holder `name` and `description`, balance `lastChangedAt`, transaction `valueDate` and `merchantCategoryCode`, and the `held`, `cancelled`, `rejected`, `scheduled` and `other` statuses.
-- **Number precision**: TrueLayer sends amounts as JSON numbers. They are converted to the shortest exact decimal string (`-2.99` → `"2.99"`), which is exact for normal currency amounts; values beyond about 15 significant digits would lose precision before the Worker sees them.
+- **Number precision**: TrueLayer sends amounts as JSON numbers. They are converted to exact decimal strings and padded to the currency's minor units (`-2.9` → `"2.90"`), which is exact for normal currency amounts; values beyond about 15 significant digits would lose precision before the Worker sees them.
 - **Duplicate accounts**: when the same bank is connected twice, all-account reads list each account once, preferring the newest connection. Matching uses the IBAN or sort code and account number (cards: network, last digits, and expiry) in memory only; these identifiers are never returned or stored.

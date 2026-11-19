@@ -1,5 +1,6 @@
 import { importPKCS8, SignJWT } from "jose";
 import { PublicError } from "../../errors";
+import { formatAmount, Money } from "../../lib/money";
 import type {
   AccountSummary,
   AccountUsage,
@@ -196,7 +197,7 @@ export class EnableBankingClient implements FinanceReader {
         institution: account.institution,
         country: account.country,
         currency: balance.balance_amount.currency,
-        amount: balance.balance_amount.amount,
+        amount: formatAmount(balance.balance_amount.amount, balance.balance_amount.currency),
         balanceType: BALANCE_TYPES[balance.balance_type],
         ...(label === undefined ? {} : { label }),
         ...(balance.reference_date === undefined ? {} : { referenceDate: balance.reference_date }),
@@ -507,7 +508,7 @@ function normalizeTransaction(accountId: string, transaction: EnableBankingTrans
 
   return {
     accountId,
-    amount: transaction.transaction_amount.amount.replace(/^-/, ""),
+    amount: formatAmount(new Money(transaction.transaction_amount.amount).abs(), transaction.transaction_amount.currency),
     currency: transaction.transaction_amount.currency,
     direction: credit ? ("credit" as const) : ("debit" as const),
     status: TRANSACTION_STATUSES[transaction.status],

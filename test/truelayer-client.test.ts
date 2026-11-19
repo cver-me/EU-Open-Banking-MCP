@@ -255,12 +255,12 @@ describe("TrueLayerClient", () => {
     expect(result.balances.map(({ accountId, amount, balanceType, label, referenceDate }) =>
       ({ accountId, amount, balanceType, label, referenceDate }))).toEqual([
       { accountId: "tl-a-acc123", amount: "1234.56", balanceType: "interim_booked", label: "current balance (booked)", referenceDate: undefined },
-      { accountId: "tl-a-acc123", amount: "1500.1", balanceType: "interim_available", label: "available balance (includes any arranged overdraft)", referenceDate: undefined },
-      { accountId: "tl-a-acc123", amount: "250", balanceType: "informational", label: "arranged overdraft limit", referenceDate: undefined },
-      { accountId: "tl-c-card9", amount: "89.9", balanceType: "interim_booked", label: "card current balance (as reported by the card issuer)", referenceDate: undefined },
-      { accountId: "tl-c-card9", amount: "910.1", balanceType: "interim_available", label: "available credit", referenceDate: undefined },
-      { accountId: "tl-c-card9", amount: "1000", balanceType: "informational", label: "credit limit", referenceDate: undefined },
-      { accountId: "tl-c-card9", amount: "45.5", balanceType: "closing_booked", label: "last statement balance", referenceDate: "2026-11-01" },
+      { accountId: "tl-a-acc123", amount: "1500.10", balanceType: "interim_available", label: "available balance (includes any arranged overdraft)", referenceDate: undefined },
+      { accountId: "tl-a-acc123", amount: "250.00", balanceType: "informational", label: "arranged overdraft limit", referenceDate: undefined },
+      { accountId: "tl-c-card9", amount: "89.90", balanceType: "interim_booked", label: "card current balance (as reported by the card issuer)", referenceDate: undefined },
+      { accountId: "tl-c-card9", amount: "910.10", balanceType: "interim_available", label: "available credit", referenceDate: undefined },
+      { accountId: "tl-c-card9", amount: "1000.00", balanceType: "informational", label: "credit limit", referenceDate: undefined },
+      { accountId: "tl-c-card9", amount: "45.50", balanceType: "closing_booked", label: "last statement balance", referenceDate: "2026-11-01" },
     ]);
   });
 
@@ -297,7 +297,7 @@ describe("TrueLayerClient", () => {
 
     const first = await client.listTransactions("tl-a-acc123", query);
     expect(first.transactions).toEqual([
-      { accountId: "tl-a-acc123", amount: "4.5", currency: "GBP", direction: "debit", status: "pending",
+      { accountId: "tl-a-acc123", amount: "4.50", currency: "GBP", direction: "debit", status: "pending",
         transactionDate: "2026-11-18", counterparty: "Pret", bankTransactionDescription: "purchase" },
       { accountId: "tl-a-acc123", amount: "12.34", currency: "GBP", direction: "debit", status: "booked",
         bookingDate: "2026-11-10", description: "TESCO STORES", reference: "bank-t1", paymentReference: "REF1",
@@ -333,7 +333,7 @@ describe("TrueLayerClient", () => {
 
     expect(page.transactions.map(({ amount, direction }) => ({ amount, direction }))).toEqual([
       { amount: "24.25", direction: "debit" },
-      { amount: "10", direction: "credit" },
+      { amount: "10.00", direction: "credit" },
     ]);
   });
 
