@@ -1,3 +1,4 @@
+# Copy to .dev.vars for `bun run dev` (cf dev). Deploys use `cf deploy --secrets-file`, not this file.
 # Each provider is optional: set all of its values, or none.
 # EU banks through Enable Banking:
 ENABLE_BANKING_APPLICATION_ID="00000000-0000-4000-8000-000000000000"

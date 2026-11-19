@@ -1,7 +1,9 @@
 node_modules/
-.wrangler/
 dist/
 coverage/
+
+# cf: build output, generated Worker types, and local dev state
+.cloudflare/
 
 # Financial credentials and local configuration
 .dev.vars*
@@ -10,6 +12,7 @@ coverage/
 !.env.example
 *.pem
 *.key
+# Used with `cf deploy --secrets-file secrets.json`
 secrets.json
 .codex/config.toml
 

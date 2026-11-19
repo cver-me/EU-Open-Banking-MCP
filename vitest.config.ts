@@ -11,7 +11,8 @@ process.env.ENABLE_BANKING_PRIVATE_KEY_PEM = TEST_PRIVATE_KEY;
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      wrangler: { configPath: "./wrangler.jsonc" },
+      // Reads the Worker settings from cloudflare.config.ts.
+      config: true,
       miniflare: {
         bindings: {
           ENABLE_BANKING_APPLICATION_ID: TEST_APPLICATION_ID,
