@@ -30,13 +30,13 @@
     "@modelcontextprotocol/server": "2.4.0",
     "agents": "0.33.0",
     "decimal.js": "10.6.0",
-    "jose": "6.2.17",
+    "jose": "6.2.18",
     "zod": "4.6.7"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.8.4",
+    "@cloudflare/vitest-plugin": "1.8.5",
     "typescript": "7.0.2",
-    "vitest": "5.1.0",
-    "wrangler": "4.164.0"
+    "vitest": "5.1.1",
+    "wrangler": "4.165.0"
   }
 }
