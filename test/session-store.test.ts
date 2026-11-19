@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { KvSessionStore } from "../src/session-store";
+import { KvSessionStore } from "../src/providers/enable-banking/session-store";
 
 const KEY = "enable-banking-session-ids-v1";
 const FIRST = "11111111-1111-4111-8111-111111111111";

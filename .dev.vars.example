@@ -1,2 +1,9 @@
+# Each provider is optional: set all of its values, or none.
+# EU banks through Enable Banking:
 ENABLE_BANKING_APPLICATION_ID="00000000-0000-4000-8000-000000000000"
 ENABLE_BANKING_PRIVATE_KEY_PEM="-----BEGIN PRIVATE KEY-----\nreplace-me\n-----END PRIVATE KEY-----"
+# UK banks through TrueLayer:
+# TRUELAYER_CLIENT_ID="sandbox-replace-me"
+# TRUELAYER_CLIENT_SECRET="replace-me"
+# Required by providers that store credentials (TrueLayer):
+# TOKEN_ENCRYPTION_KEY="output of: openssl rand -base64 32"

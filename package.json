@@ -7,7 +7,7 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "dev": "wrangler dev",
-    "types": "wrangler types --strict-vars false",
+    "types": "wrangler types --strict-vars false --env-file .dev.vars.example",
     "typecheck": "bun run types && tsc --noEmit",
     "test": "vitest run",
     "check": "bun run typecheck && bun run test && wrangler deploy --dry-run",

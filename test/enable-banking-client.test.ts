@@ -1,15 +1,15 @@
 import { exportPKCS8, generateKeyPair, jwtVerify } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AppConfig } from "../src/config";
+import type { EnableBankingConfig } from "../src/providers/enable-banking/config";
 import { EnableBankingClient } from "../src/providers/enable-banking/client";
-import type { SessionStore } from "../src/session-store";
+import type { SessionStore } from "../src/providers/enable-banking/session-store";
 
 const SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const SECOND_SESSION_ID = "55555555-5555-4555-8555-555555555555";
 const ACCOUNT_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_ACCOUNT_ID = "44444444-4444-4444-8444-444444444444";
 
-let config: AppConfig;
+let config: EnableBankingConfig;
 let providerPublicKey: CryptoKey;
 let sessions: SessionStore;
 
@@ -17,10 +17,8 @@ beforeAll(async () => {
   const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
   providerPublicKey = publicKey;
   config = {
-    enableBanking: {
-      applicationId: "00000000-0000-4000-8000-000000000000",
-      privateKeyPem: await exportPKCS8(privateKey),
-    },
+    applicationId: "00000000-0000-4000-8000-000000000000",
+    privateKeyPem: await exportPKCS8(privateKey),
   };
 });
 
@@ -35,6 +33,40 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("EnableBankingClient", () => {
+  it("keeps currency accounts that share one IBAN, while still merging the same account across sessions", async () => {
+    // Old session: EUR main + second EUR account. New session: EUR main again + its GBP account (same IBAN).
+    const OLD_EUR_MAIN = "a0000000-0000-4000-8000-000000000001";
+    const OLD_EUR_OTHER = "a0000000-0000-4000-8000-000000000002";
+    const NEW_EUR_MAIN = "b0000000-0000-4000-8000-000000000001";
+    const NEW_GBP = "b0000000-0000-4000-8000-000000000002";
+    const currencies: Record<string, string> = {
+      [OLD_EUR_MAIN]: "EUR", [OLD_EUR_OTHER]: "EUR", [NEW_EUR_MAIN]: "EUR", [NEW_GBP]: "GBP",
+    };
+    sessions.list = vi.fn(async () => [SESSION_ID, SECOND_SESSION_ID]);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.startsWith("/sessions/")) {
+        const second = path.endsWith(SECOND_SESSION_ID);
+        const accounts = second
+          ? [{ uid: NEW_EUR_MAIN, identification_hash: "iban-main" }, { uid: NEW_GBP, identification_hash: "iban-main" }]
+          : [{ uid: OLD_EUR_MAIN, identification_hash: "iban-main" }, { uid: OLD_EUR_OTHER, identification_hash: "iban-other" }];
+        return Response.json({
+          status: "AUTHORIZED",
+          accounts: accounts.map(({ uid }) => uid),
+          accounts_data: accounts,
+          aspsp: { name: "Revolut", country: "IT" },
+          psu_type: "personal",
+        });
+      }
+      const accountId = path.split("/")[2]!;
+      return Response.json({ currency: currencies[accountId], cash_account_type: "CACC" });
+    });
+
+    const client = new EnableBankingClient(config, sessions);
+    expect(await client.listAccountIds()).toEqual([OLD_EUR_MAIN, OLD_EUR_OTHER, NEW_GBP]);
+    expect((await client.listAccounts()).map(({ currency }) => currency)).toEqual(["EUR", "EUR", "GBP"]);
+  });
+
   it.each(["same", "different", "absent"])(
     "matches accounts across sessions only using primary identity hashes (%s)",
     async (identity) => {
@@ -245,7 +277,7 @@ describe("EnableBankingClient", () => {
     expect(protectedHeader).toMatchObject({
       alg: "RS256",
       typ: "JWT",
-      kid: config.enableBanking.applicationId,
+      kid: config.applicationId,
     });
     expect(payload.exp).toBe((payload.iat ?? 0) + 3_600);
     expect(JSON.stringify(result)).not.toContain("provider-transaction-id-not-exposed");
@@ -420,10 +452,10 @@ describe("EnableBankingClient", () => {
 
   it("forwards online PSU context only to account-data requests", async () => {
     const fetchMock = mockProvider(async () => Response.json({ balances: [] }));
-    const client = new EnableBankingClient(config, sessions, [
-      ["Psu-Ip-Address", "203.0.113.7"],
-      ["Psu-User-Agent", "Personal Finance MCP Test"],
-    ]);
+    const client = new EnableBankingClient(config, sessions, {
+      ipAddress: "203.0.113.7",
+      userAgent: "Personal Finance MCP Test",
+    });
 
     await client.getBalances(ACCOUNT_ID);
 

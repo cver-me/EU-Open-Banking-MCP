@@ -1,8 +1,9 @@
 import { createMcpHandler } from "agents/mcp/server";
-import { loadConfig } from "./config";
+import { Aggregate } from "./aggregate";
+import { psuContextFromRequest } from "./lib/psu";
 import { createFinanceServer } from "./mcp/server";
-import { enableBankingPsuHeadersFromRequest } from "./providers/enable-banking/psu-headers";
-import { KvSessionStore } from "./session-store";
+import { configuredProviders, type ProviderEnv } from "./providers/registry";
+import type { BankProvider } from "./providers/types";
 import { handleSetupRequest } from "./setup";
 
 const SECURITY_HEADERS = {
@@ -26,9 +27,9 @@ export default {
       return withSecurityHeaders(Response.json({ error: "access_required" }, { status: 403 }));
     }
 
-    let config;
+    let providers: BankProvider[];
     try {
-      config = loadConfig(env);
+      providers = configuredProviders(env as unknown as ProviderEnv);
     } catch (error) {
       console.error(
         JSON.stringify({
@@ -39,17 +40,13 @@ export default {
       return withSecurityHeaders(Response.json({ error: "service_unavailable" }, { status: 503 }));
     }
 
-    const url = new URL(request.url);
-    const sessions = new KvSessionStore(env.SESSION_STORE);
-    const setupResponse = await handleSetupRequest(request, config, sessions);
-    if (setupResponse !== undefined) return withSecurityHeaders(setupResponse);
-
-    if (url.pathname !== "/mcp") {
-      return withSecurityHeaders(Response.json({ error: "not_found" }, { status: 404 }));
+    if (new URL(request.url).pathname !== "/mcp") {
+      const setupResponse = await handleSetupRequest(request, providers);
+      return withSecurityHeaders(setupResponse ?? Response.json({ error: "not_found" }, { status: 404 }));
     }
 
-    const psuHeaders = enableBankingPsuHeadersFromRequest(request);
-    const handler = createMcpHandler(() => createFinanceServer(config, sessions, psuHeaders), {
+    const psu = psuContextFromRequest(request);
+    const handler = createMcpHandler(() => createFinanceServer(new Aggregate(providers, psu)), {
       route: "/mcp",
       corsOptions: false,
       legacy: "stateless",

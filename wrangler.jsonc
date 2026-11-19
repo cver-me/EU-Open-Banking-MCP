@@ -18,18 +18,14 @@
     }
   },
 
-  // Deploy buttons provision this namespace automatically. It stores only
-  // Enable Banking session IDs created through the protected setup flow.
+  // Deploy buttons provision this namespace automatically. It stores Enable
+  // Banking session IDs and, when TrueLayer is configured, encrypted TrueLayer
+  // token records created through the protected setup flow.
   "kv_namespaces": [{ "binding": "SESSION_STORE" }],
 
-  // Values are never stored here. Wrangler uses these declarations for
-  // generated types and refuses a deployment when a secret is missing.
-  "secrets": {
-    "required": [
-      "ENABLE_BANKING_APPLICATION_ID",
-      "ENABLE_BANKING_PRIVATE_KEY_PEM"
-    ]
-  },
+  // No secrets are declared as required: each provider is optional and is enabled by
+  // setting all of its secrets (see README). Declaring them here would make
+  // `wrangler deploy` and `wrangler dev` demand secrets for providers you don't use.
 
   // Code logs metadata only; financial payloads and upstream bodies are never logged.
   "observability": {

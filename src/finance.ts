@@ -1,8 +1,10 @@
 import { z } from "zod";
 
+// Each provider issues its own ID format; the aggregate routes IDs to the provider that owns them.
 export const accountIdSchema = z
-  .uuid()
-  .describe("Opaque Enable Banking account ID discovered from an active authorization session");
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,140}$/)
+  .describe("Opaque account ID discovered by finance_list_accounts from an active bank connection");
 
 export const countryCodeSchema = z
   .string()
@@ -17,12 +19,12 @@ export const currencySchema = z
 export const exactDecimalAmountSchema = z
   .string()
   .regex(/^-?\d+(?:\.\d+)?$/)
-  .describe("Exact decimal amount encoded as a string; use currency for its unit");
+  .describe("Exact decimal amount as a string, with at least the currency's minor-unit digits (\"9000.00\" GBP, \"1500\" JPY); never rounded. Always read it together with its currency");
 
 export const nonNegativeDecimalAmountSchema = z
   .string()
   .regex(/^\d+(?:\.\d+)?$/)
-  .describe("Exact non-negative decimal amount encoded as a string; use currency for its unit");
+  .describe("Exact non-negative decimal amount as a string, with at least the currency's minor-unit digits; never rounded. Always read it together with its currency");
 
 export const isoDateSchema = z.iso.date();
 
@@ -61,9 +63,9 @@ export const transactionStatusSchema = z.enum([
 
 export const accountSummarySchema = z.object({
   accountId: accountIdSchema.describe("Opaque account ID accepted by the other finance tools"),
-  institution: z.string().describe("Bank or financial institution reported by Enable Banking"),
-  country: countryCodeSchema,
-  currency: currencySchema,
+  institution: z.string().describe("Bank or financial institution reported by the data provider"),
+  country: countryCodeSchema.describe("Country of the bank; does not imply the account's currency"),
+  currency: currencySchema.describe("The account's own currency. Not implied by country: a UK bank can hold a EUR account and an EU bank a GBP account. Balances and transactions state their own currency"),
   name: z.string().optional().describe("Account holder name reported by the bank"),
   product: z.string().optional().describe("Bank's product name for the account"),
   description: z.string().optional().describe("Account description supplied by the bank or account owner"),
@@ -77,7 +79,7 @@ export const balanceSchema = z.object({
   accountId: accountIdSchema,
   institution: z.string().describe("Bank or financial institution for this balance"),
   country: countryCodeSchema,
-  currency: currencySchema,
+  currency: currencySchema.describe("Currency of this balance amount"),
   amount: exactDecimalAmountSchema,
   balanceType: balanceTypeSchema.describe("Normalized meaning of this balance measurement"),
   label: z.string().optional().describe("Bank-provided balance label; use it to interpret other or ambiguous balance types"),
@@ -98,7 +100,7 @@ export const transactionSchema = z.object({
   amount: nonNegativeDecimalAmountSchema.describe(
     "Absolute transaction amount as an exact decimal string; direction determines credit or debit",
   ),
-  currency: currencySchema,
+  currency: currencySchema.describe("Currency of this transaction amount; can differ from the account's currency"),
   direction: z
     .enum(["credit", "debit"])
     .describe("credit adds funds to the account; debit removes funds from the account"),
@@ -170,4 +172,17 @@ export function resolveSpendingDate(
 export interface TransactionPage {
   transactions: Transaction[];
   continuationKey?: string;
+  /** The bank refused to share part of the requested range; no older pages follow. */
+  historyUnavailable?: boolean;
 }
+
+// Provider keys come from the provider modules; shared schemas don't list them.
+export const providerKeySchema = z.string().regex(/^[a-z][a-z0-9_]{0,39}$/);
+export type ProviderKey = z.infer<typeof providerKeySchema>;
+
+export const providerErrorSchema = z.object({
+  provider: providerKeySchema.describe("Key of the data provider that could not be read; its accounts are missing from the result"),
+  code: z.string().min(1).max(100).describe("Stable machine-readable failure code"),
+  message: z.string().min(1).max(500).describe("Safe explanation without provider payloads"),
+});
+export type ProviderError = z.infer<typeof providerErrorSchema>;

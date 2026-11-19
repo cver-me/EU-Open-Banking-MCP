@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MAX_PROVIDER_AMOUNT_LENGTH } from "../../money";
+import { MAX_PROVIDER_AMOUNT_LENGTH } from "../../lib/money";
 import {
   countryCodeSchema,
   currencySchema,
