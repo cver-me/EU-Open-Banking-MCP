@@ -16,7 +16,8 @@ The primary assets are:
 
 - the Enable Banking RSA private key and application ID;
 - Enable Banking session IDs stored in Workers KV;
-- TrueLayer client secret, `TOKEN_ENCRYPTION_KEY`, and the encrypted TrueLayer refresh/access tokens stored in Workers KV (optional UK support);
+- the TrueLayer client secret and the encrypted TrueLayer refresh/access tokens stored in Workers KV (optional UK support);
+- `TOKEN_ENCRYPTION_KEY`, which seals those tokens; rotating it makes stored connections unreadable;
 - Cloudflare Access OAuth credentials and tokens;
 - balances, transactions, counterparties, and derived summaries.
 
@@ -30,8 +31,8 @@ The intended security boundary is:
 4. Each provider module discovers account IDs from active stored sessions or connections and rejects other IDs.
    TrueLayer refresh tokens are long-lived credentials, so they are sealed with AES-256-GCM before reaching KV; reading KV alone does not reveal them.
 5. User-triggered account reads forward the bounded Cloudflare connecting-client IP and MCP client
-   User-Agent as Enable Banking's `Psu-Ip-Address` and `Psu-User-Agent` headers. Those values are
-   request-scoped and are neither stored nor logged.
+   User-Agent as Enable Banking's `Psu-Ip-Address` and `Psu-User-Agent` headers, and only the IP as
+   TrueLayer's `X-PSU-IP`. Those values are request-scoped and are neither stored nor logged.
 6. The Worker stores no financial responses and returns `Cache-Control: no-store`.
 
 ## Deployment assumptions

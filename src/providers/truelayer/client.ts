@@ -576,7 +576,7 @@ function normalizeTransaction(
 ): Transaction {
   const date = ukLocalDate(transaction.timestamp);
   const credit = transaction.transaction_type === "CREDIT";
-  // Banks fill different fields: Starling, for example, sends the merchant only in meta.
+  // Banks fill different fields; some send the merchant only in meta.
   const counterparty = optionalText(transaction.merchant_name) ??
     optionalText(transaction.meta?.provider_merchant_name) ??
     optionalText(transaction.meta?.counter_party_preferred_name) ??

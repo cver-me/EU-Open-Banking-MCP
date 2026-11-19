@@ -27,6 +27,10 @@ That model matches this project's security boundary:
 
 Dashboard linking is not itself API authorization. After deployment, `/setup` still sends the owner through their bank's consent flow and stores the resulting Enable Banking session ID. This second step is required even when the same account was already linked in the dashboard.
 
+## Why TrueLayer for UK banks
+
+Enable Banking covers EEA banks only. For UK accounts, TrueLayer's Data API lets a developer account use its Live environment with the owner's own accounts (TrueLayer labels such an app as being in testing mode until it is reviewed for production). It uses OAuth with refresh tokens, so the Worker stores one encrypted refresh token per bank connection, and UK consent must be reconfirmed every 90 days.
+
 ## Architecture
 
 ```mermaid
@@ -54,24 +58,24 @@ The Worker does not store balances, transactions, account UUIDs, IBANs, authoriz
 
 | Tool | Purpose | Bounds |
 | --- | --- | --- |
-| `finance_list_accounts` | Discover active accounts and bank-provided metadata | 20 authorized sessions, 20 active accounts |
+| `finance_list_accounts` | Discover active accounts and bank-provided metadata | Per provider: Enable Banking 20 sessions and 20 accounts; TrueLayer 10 connections and 20 accounts |
 | `finance_get_balances` | One discovered account or all active accounts | Partial per-account results; sequential within each bank |
 | `finance_get_spending` | Gross debit estimate with date provenance and separate booked/pending/held totals | 366 days, 20 pages, 10,000 matching transactions, 200 returned details |
 | `finance_list_transactions` | Paginated normalized transactions | 366 days, 200 results per response |
 | `finance_search_transactions` | Text search over transaction metadata | 366 days, 5 provider pages, 100 matches |
 | `finance_summarize_cash_flow` | Booked credit/debit/net totals by currency | 366 days, 20 pages, 10,000 transactions |
 
-`finance_list_accounts` returns an opaque, session-specific `accountId`. Tools that target one account accept that ID and verify it against the active Enable Banking sessions before use. No aliases or manually copied account UUIDs are required. All-account reads deduplicate sessions referring to the same primary account identity hash, when supplied by Enable Banking. These hashes stay in request memory and are never exposed or persisted; names and secondary fuzzy hashes are never used to guess account identity.
+`finance_list_accounts` returns an opaque `accountId` for every account of every configured provider. Tools that target one account accept that ID, route it to the provider that issued it, and verify it against that provider's active sessions or connections before use. No aliases or manually copied account IDs are required. When the same account is reachable through two sessions or connections, all-account reads list it once: Enable Banking accounts match on the primary identification hash, TrueLayer accounts on the IBAN or sort code and account number, and in both cases the currency must match too, so currency accounts that share one IBAN stay separate. These identifiers stay in request memory and are never exposed or persisted; names and secondary fuzzy hashes are never used to guess account identity.
 
 Pagination `nextCursor` values contain encoded continuation state; they are opaque but not confidential. Return them unchanged with the same account and filters. The Worker validates their embedded context before use.
 
-Every tool is read-only, non-destructive, and idempotent. Provider codes are normalized into descriptive values such as `interim_available`, `booked`, and `professional`. Multiple balances for one account are alternative measurements and must never be added together. Balance labels and bank timestamps are preserved; a fresh fetch does not establish a fresh measurement. Monetary calculations never combine currencies. Provider amount strings are bounded to 100 characters, and aggregation precision accommodates mixed decimal scales and the 10,000-entry limit without rounding.
+Every tool is read-only, non-destructive, and idempotent. Provider codes are normalized into descriptive values such as `interim_available`, `booked`, and `professional`. Multiple balances for one account are alternative measurements and must never be added together. Balance labels and bank timestamps are preserved; a fresh fetch does not establish a fresh measurement. Monetary calculations never combine currencies. Every account has its own `currency`, which a bank's country does not imply, and every balance and transaction states the currency of its amount. Amounts are exact decimal strings with at least the currency's minor-unit digits (`"9000.00"` GBP, `"1500"` JPY), never rounded. Provider amount strings are bounded to 100 characters, and aggregation precision accommodates mixed decimal scales and the 10,000-entry limit without rounding.
 
 For everyday spending questions, `finance_get_spending` scans all active accounts unless one is selected. Its default response contains totals and completeness information; set `includeTransactions: true` for up to 200 supporting entries with `effectiveDate` and `dateSource`. It uses the bank-reported transaction date when supplied, otherwise the earlier booking or value date as an inferred fallback. The response separates gross debit totals into `booked`, `pending`, and `held` in `totalsByStatus`. Undated debits and unknown statuses are excluded from totals. `incompleteReasons` explains scan limits, repeated cursors, inferred dates, and exclusions. The provider query uses seven-day padding to catch nearby postings; neither padding nor `complete: true` guarantees that a bank supplied every historical payment.
 
 These totals are account activity, not classified household expenses: internal transfers, cash withdrawals, and card repayments may be included, and refunds are not netted. `finance_summarize_cash_flow` includes only booked records, enforcing the status filter locally as well as at the provider. Its credits are not necessarily income and its debits are not necessarily expenses. List and search tools use the provider's date-range semantics; those filters are not guaranteed to select purchase dates.
 
-See [the API-to-MCP mapping](docs/api-to-mcp.md) for the preserved fields, derived values, and interpretation limits.
+See [the API-to-MCP mapping](docs/api-to-mcp.md) for the preserved fields, derived values, and interpretation limits, and [provider parity](docs/provider-parity.md) for how Enable Banking and TrueLayer fields compare.
 
 Date ranges include both endpoints and cover at most 366 calendar days. Search and summary scans stop on repeated provider continuation keys and mark the result incomplete instead of repeatedly fetching the same page.
 
@@ -101,7 +105,7 @@ Installation establishes three separate trust relationships: the Worker proves i
 | --- | --- | --- |
 | Register the Enable Banking application | Worker → Enable Banking identity | The application UUID and RSA key sign provider requests |
 | Link accounts in the Enable Banking dashboard | Production account whitelist | A restricted application may fetch data only from pre-approved personal accounts |
-| Deploy the Worker | Private MCP runtime and session storage | Cloudflare runs the code and provisions KV for session IDs only |
+| Deploy the Worker | Private MCP runtime and session storage | Cloudflare runs the code and provisions KV for session IDs and encrypted connection records |
 | Enable Cloudflare Access and Managed OAuth | MCP client → Worker identity | The private Worker rejects callers who are not explicitly allowed |
 | Connect each bank through `/setup` | Bank consent and active Enable Banking session | Whitelisting limits scope; bank authorization actually grants API access |
 
@@ -146,7 +150,7 @@ Cloudflare documents this behavior in [Deploy to Cloudflare buttons](https://dev
 1. Open Zero Trust → Access controls → Applications → the Access application created during deployment.
 2. Open **Advanced settings**, enable **Managed OAuth**, and save.
 
-If **Protect with Cloudflare Access** was not enabled during deployment, attach Worker-level Access manually before continuing. Until Access is attached, the Worker fails closed with `403 access_required` because Cloudflare did not provide `ctx.access`. Worker-level Access protects `/`, `/setup`, `/callback`, and `/mcp` across the Worker's associated domains. See Cloudflare's [Worker-level Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
+If **Protect with Cloudflare Access** was not enabled during deployment, attach Worker-level Access manually before continuing. Until Access is attached, the Worker fails closed with `403 access_required` because Cloudflare did not provide `ctx.access`. Worker-level Access protects `/`, `/setup`, `/callback`, `/callback/truelayer`, and `/mcp` across the Worker's associated domains. See Cloudflare's [Worker-level Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
 
 Managed OAuth exposes the protected-resource and authorization-server discovery metadata used by MCP clients. Cloudflare validates the request before Worker invocation; this project does not duplicate Cloudflare's JWT verifier.
 
@@ -181,7 +185,7 @@ Enable Banking covers EEA banks only. UK accounts can be added through TrueLayer
 
 3. Open `/setup`, choose **Connect a UK bank**, and authorize at the bank. The callback validates `state`, completes a PKCE code exchange with the `offline_access` scope, and stores the encrypted refresh token.
 
-UK accounts appear in the same tools with IDs prefixed `tl-a-` (bank accounts) or `tl-c-` (cards). TrueLayer has no pagination; the Worker reads transactions in 92-day windows, newest first, and exposes each window as a page, so a one-year scan takes four pages per account. UK consent must be reconfirmed every 90 days: `/setup` shows the expiry date, warns 14 days ahead, and has a **Reconnect** button that removes the old connection once the same bank is connected again. Most UK banks only share history older than 90 days shortly after connecting. Banks that refuse older dates make `finance_list_transactions` return `historyUnavailable: true` and the scanning tools report `history_unavailable` in `incompleteReasons`; some banks (Starling, for example) return empty results instead, which cannot be told apart from no activity.
+UK accounts appear in the same tools with IDs prefixed `tl-a-` (bank accounts) or `tl-c-` (cards). TrueLayer has no pagination; the Worker reads transactions in 92-day windows, newest first, and exposes each window as a page, so a one-year scan takes four pages per account. UK consent must be reconfirmed every 90 days: `/setup` shows the expiry date, warns 14 days ahead, and has a **Reconnect** button that removes the old connection once the same bank is connected again. Most UK banks only share history older than 90 days shortly after connecting. Banks that refuse older dates make `finance_list_transactions` return `historyUnavailable: true` and the scanning tools report `history_unavailable` in `incompleteReasons`; some banks return empty results instead, which cannot be told apart from no activity.
 
 If one provider fails while the other works, all-account tools still return the working provider's accounts and list the failure in `providerErrors`; spending and cash-flow results are then marked incomplete with `provider_unavailable`.
 
@@ -216,7 +220,7 @@ There is intentionally no `/health` endpoint. Cloudflare Workers do not require 
 - User-triggered account reads forward bounded `Psu-Ip-Address` and `Psu-User-Agent` values derived
   from the incoming Cloudflare request; session discovery and authorization requests do not receive
   those headers.
-- Account enforcement: every supplied account ID must belong to an active stored session.
+- Account enforcement: every supplied account ID must belong to an active stored session or connection of the provider that issued it.
 - Setup and callback routes are behind Worker-level Access and validate origin/state.
 - Authorization codes are exchanged immediately and never persisted.
 - KV stores Enable Banking session IDs and application-encrypted TrueLayer token records, and is also encrypted at rest by Cloudflare. TrueLayer reads forward only the bounded connecting-client IP as `X-PSU-IP`.
