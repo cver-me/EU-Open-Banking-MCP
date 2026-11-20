@@ -1,4 +1,4 @@
-import type { AccountSummary, ProviderError, ProviderKey, TransactionPage } from "./finance";
+import type { AccountSummary, ConnectionStatus, ProviderError, ProviderKey, TransactionPage } from "./finance";
 import type { PsuContext } from "./lib/psu";
 import { isSetupRequired, publicErrorFields, setupRequired, unknownAccount } from "./providers/shared";
 import type { BalanceReadResult, BankProvider, FinanceReader, TransactionQuery } from "./providers/types";
@@ -55,6 +55,12 @@ export class Aggregate {
     };
   }
 
+  async listConnections(): Promise<ProviderResult<ConnectionStatus[]>> {
+    const { values, providerErrors } = await this.fromAll(async (reader, name) =>
+      (await reader.connectionStatuses()).map((status) => ({ provider: name, ...status })));
+    return { value: values.flat(), providerErrors };
+  }
+
   listTransactions(accountId: string, query: TransactionQuery): Promise<TransactionPage> {
     return this.readerFor(accountId).listTransactions(accountId, query);
   }
@@ -71,9 +77,9 @@ export class Aggregate {
    * answers does the call fail: with setup_required if nothing is connected anywhere.
    */
   private async fromAll<T>(
-    read: (reader: FinanceReader) => Promise<T>,
+    read: (reader: FinanceReader, name: ProviderKey) => Promise<T>,
   ): Promise<{ values: T[]; providerErrors: ProviderError[] }> {
-    const settled = await Promise.allSettled(this.providers.map(({ reader }) => read(reader)));
+    const settled = await Promise.allSettled(this.providers.map(({ reader, name }) => read(reader, name)));
     const values: T[] = [];
     const providerErrors: ProviderError[] = [];
     let firstFailure: unknown;

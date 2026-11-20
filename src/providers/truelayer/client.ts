@@ -6,6 +6,7 @@ import {
   type Balance,
   type BalanceType,
   type CashAccountType,
+  type ConnectionStatus,
   type Transaction,
   type TransactionPage,
 } from "../../finance";
@@ -14,6 +15,7 @@ import { formatAmount, Money } from "../../lib/money";
 import type { PsuContext } from "../../lib/psu";
 import {
   bankRateLimited,
+  consentState,
   groupBy,
   optionalText,
   parseProviderResponse as sharedParseProviderResponse,
@@ -203,6 +205,15 @@ export class TrueLayerClient implements FinanceReader {
       ...(record.providerId === undefined ? {} : { providerId: record.providerId }),
       ...(record.providerName === undefined ? {} : { institution: record.providerName }),
       ...(record.consentExpiresAt === undefined ? {} : { consentExpiresAt: record.consentExpiresAt }),
+    }));
+  }
+
+  async connectionStatuses(): Promise<Array<Omit<ConnectionStatus, "provider">>> {
+    return (await this.listConnections()).map((connection) => ({
+      institution: connection.institution ?? "UK bank",
+      country: COUNTRY,
+      state: consentState(connection.consentExpiresAt),
+      ...(connection.consentExpiresAt === undefined ? {} : { consentExpiresAt: connection.consentExpiresAt }),
     }));
   }
 

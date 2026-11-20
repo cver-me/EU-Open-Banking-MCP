@@ -141,6 +141,9 @@ export const sessionSchema = z.object({
   })).max(MAX_ENABLE_BANKING_ACCOUNTS)),
   aspsp: aspspSchema,
   psu_type: z.enum(["business", "personal"]),
+  access: optionalProviderField(z.object({
+    valid_until: optionalProviderField(z.string().max(100)),
+  })),
 });
 
 export const accountDetailsSchema = z.object({

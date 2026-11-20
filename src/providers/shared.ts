@@ -214,3 +214,14 @@ export function parseProviderResponse<T extends z.ZodType>(
 export function optionalText(value: string | null | undefined): string | undefined {
   return value?.trim() || undefined;
 }
+
+/** Days before a consent ends from which it is reported as expiring soon. */
+export const CONSENT_WARNING_DAYS = 14;
+
+/** State of a consent that gives access until `expiresAt` (any date-time string). */
+export function consentState(expiresAt: string | undefined, now = Date.now()): "active" | "expiring_soon" | "expired" {
+  const end = expiresAt === undefined ? Number.NaN : Date.parse(expiresAt);
+  if (Number.isNaN(end)) return "active";
+  if (end <= now) return "expired";
+  return end - now < CONSENT_WARNING_DAYS * 86_400_000 ? "expiring_soon" : "active";
+}

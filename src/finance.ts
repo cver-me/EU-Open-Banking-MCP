@@ -139,13 +139,6 @@ export type CashAccountType = z.infer<typeof cashAccountTypeSchema>;
 export type Transaction = z.infer<typeof transactionSchema>;
 export type TransactionStatus = z.infer<typeof transactionStatusSchema>;
 
-export const spendingTransactionSchema = transactionSchema.extend({
-  effectiveDate: isoDateSchema.describe("Date the Worker used to include this debit in the requested range"),
-  dateSource: z.enum(["transaction_date", "booking_date", "value_date"])
-    .describe("Source of effectiveDate; booking_date and value_date are inferred fallbacks, not verified purchase dates"),
-});
-export type SpendingTransaction = z.infer<typeof spendingTransactionSchema>;
-
 export interface SpendingDateResolution {
   effectiveDate?: string;
   inferred: boolean;
@@ -186,3 +179,17 @@ export const providerErrorSchema = z.object({
   message: z.string().min(1).max(500).describe("Safe explanation without provider payloads"),
 });
 export type ProviderError = z.infer<typeof providerErrorSchema>;
+
+export const connectionStateSchema = z.enum(["active", "expiring_soon", "expired", "needs_reconnect", "unavailable"]);
+export type ConnectionState = z.infer<typeof connectionStateSchema>;
+
+/** One bank connection (consent) and whether it still gives access. */
+export const connectionStatusSchema = z.object({
+  provider: providerKeySchema.describe("Data provider that holds this connection"),
+  institution: z.string().optional().describe("Bank the connection is with"),
+  country: countryCodeSchema.optional(),
+  state: connectionStateSchema.describe("expiring_soon: consent ends within 14 days; expired and needs_reconnect: no data until the owner reconnects at /setup; unavailable: the provider could not report this connection"),
+  consentExpiresAt: z.string().optional().describe("When the bank consent ends, as reported by the provider"),
+  accountCount: z.number().int().optional(),
+});
+export type ConnectionStatus = z.infer<typeof connectionStatusSchema>;

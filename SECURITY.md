@@ -26,14 +26,14 @@ The principal threats are unauthenticated MCP access, confused-deputy calls to a
 The intended security boundary is:
 
 1. Worker-level Cloudflare Access authenticates the caller before invocation, and the Worker fails closed unless Cloudflare supplies a validated `ctx.access` context.
-2. The MCP layer exposes only bounded semantic read tools.
+2. The MCP layer exposes only bounded semantic read tools. `/mcp` refuses requests whose `Origin` is another site, and the server instructions tell the model to treat payee names, descriptions and references (written by banks, merchants and other people) as data, never as instructions.
 3. The setup routes can only start, complete, and close Enable Banking or TrueLayer account authorization; they are not MCP tools. TrueLayer authorization uses `state` plus PKCE.
 4. Each provider module discovers account IDs from active stored sessions or connections and rejects other IDs.
    TrueLayer refresh tokens are long-lived credentials, so they are sealed with AES-256-GCM before reaching KV; reading KV alone does not reveal them.
 5. User-triggered account reads forward the bounded Cloudflare connecting-client IP and MCP client
    User-Agent as Enable Banking's `Psu-Ip-Address` and `Psu-User-Agent` headers, and only the IP as
    TrueLayer's `X-PSU-IP`. Those values are request-scoped and are neither stored nor logged.
-6. The Worker stores no financial responses and returns `Cache-Control: no-store`.
+6. The Worker stores no financial responses and returns `Cache-Control: no-store`. Recent bank reads are kept in memory only, for at most five minutes, in one Durable Object in the EU jurisdiction that has no public route and is reached only through the Worker's binding; nothing is written to its storage, and it is cleared whenever a bank connection changes.
 
 ## Deployment assumptions
 
