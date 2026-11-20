@@ -1,4 +1,4 @@
-import { bindings, defineConfig } from "cf/config";
+import { bindings, defineConfig, exports } from "cf/config";
 
 // Every provider is optional, so its secrets are never declared for deploys:
 // bindings.secret() marks a secret as required, and `cf deploy` would refuse to
@@ -38,7 +38,13 @@ export default defineConfig(({ mode }) => ({
 				identity: { email: "owner@example.invalid" },
 			},
 		},
+		// Shared in-memory cache of bank reads (src/cache/finance-cache.ts). SQLite storage is
+		// what the free plan offers for Durable Objects; the cache itself never writes to it.
+		exports: {
+			FinanceCache: exports.durableObject({ storage: "sqlite" }),
+		},
 		env: {
+			FINANCE_CACHE: bindings.durableObject({ worker: "finance", exportName: "FinanceCache" }),
 			// Stores Enable Banking session IDs and encrypted TrueLayer token records.
 			// No ID: `cf deploy` reuses the namespace already bound to the Worker, or creates one.
 			SESSION_STORE: bindings.kv({}),

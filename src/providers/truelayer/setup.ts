@@ -13,6 +13,7 @@ import {
   requireSameOrigin,
   setupErrorResponse,
 } from "../../lib/web";
+import { CONSENT_WARNING_DAYS } from "../shared";
 import type { ProviderSetup } from "../types";
 import { trueLayerAuthorizationUrl, type TrueLayerClient, type TrueLayerConnectionSummary } from "./client";
 import type { TrueLayerConfig } from "./config";
@@ -21,7 +22,6 @@ const CONNECT_PATH = "/setup/truelayer/connect";
 const REMOVE_PATH = "/setup/truelayer/remove";
 const CALLBACK_PATH = "/callback/truelayer";
 const STATE_COOKIE = "truelayer_setup_state";
-const RENEWAL_WARNING_DAYS = 14;
 
 export class TrueLayerSetup implements ProviderSetup {
   constructor(
@@ -98,7 +98,7 @@ function trueLayerSection(url: URL, connections: TrueLayerConnectionSummary[], n
         ? ""
         : expiresAt <= now
           ? " — consent EXPIRED: reconnect to resume access"
-          : daysLeft < RENEWAL_WARNING_DAYS
+          : daysLeft < CONSENT_WARNING_DAYS
             ? ` — consent expires in ${daysLeft} day(s): reconnect soon`
             : ` — consent expires ${connection.consentExpiresAt!.slice(0, 10)}`;
       const label = `${connection.institution ?? "UK bank"} — connected ${connection.createdAt.slice(0, 10)}${expiry}`;

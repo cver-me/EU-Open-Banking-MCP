@@ -2,6 +2,7 @@ import type {
   AccountReadError,
   AccountSummary,
   Balance,
+  ConnectionStatus,
   ProviderKey,
   TransactionPage,
   TransactionStatus,
@@ -31,6 +32,8 @@ export interface FinanceReader {
   listAccountIds(): Promise<string[]>;
   getBalances(accountId?: string): Promise<BalanceReadResult>;
   listTransactions(accountId: string, query: TransactionQuery): Promise<TransactionPage>;
+  /** Every stored connection with its state, including ones that no longer give access. */
+  connectionStatuses(): Promise<Array<Omit<ConnectionStatus, "provider">>>;
 }
 
 /** One provider's part of the protected /setup flow. */

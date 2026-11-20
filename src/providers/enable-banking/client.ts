@@ -8,6 +8,7 @@ import type {
   Balance,
   BalanceType,
   CashAccountType,
+  ConnectionStatus,
   Transaction,
   TransactionPage,
   TransactionStatus,
@@ -15,6 +16,7 @@ import type {
 import type { PsuContext } from "../../lib/psu";
 import {
   bankRateLimited,
+  consentState,
   groupBy,
   optionalText,
   parseProviderResponse,
@@ -65,6 +67,7 @@ export interface ConnectionSummary {
   psuType?: "business" | "personal";
   status: string;
   accountCount?: number;
+  validUntil?: string;
 }
 
 export interface StartAuthorizationInput {
@@ -123,6 +126,8 @@ export class EnableBankingClient implements FinanceReader {
   private token: { promise: Promise<string>; refreshAt: number } | undefined;
   private accountsPromise: Promise<AuthorizedAccount[]> | undefined;
   private readonly detailsPromises = new Map<string, Promise<z.output<typeof accountDetailsSchema>>>();
+  // One request often needs a session twice (accounts and connection status); read it once.
+  private readonly sessionPromises = new Map<string, Promise<z.output<typeof sessionSchema>>>();
 
   private readonly psuHeaders: EnableBankingPsuHeaders | undefined;
 
@@ -240,9 +245,7 @@ export class EnableBankingClient implements FinanceReader {
     return Promise.all(
       (await this.sessions.list()).map(async (sessionId) => {
         try {
-          const session = sessionSchema.parse(
-            await this.request(`/sessions/${encodeURIComponent(sessionId)}`),
-          );
+          const session = await this.session(sessionId);
           return {
             sessionId,
             institution: session.aspsp.name,
@@ -250,12 +253,29 @@ export class EnableBankingClient implements FinanceReader {
             psuType: session.psu_type,
             status: session.status,
             accountCount: session.accounts.length,
+            ...(session.access?.valid_until === undefined ? {} : { validUntil: session.access.valid_until }),
           };
         } catch {
           return { sessionId, status: "UNAVAILABLE" };
         }
       }),
     );
+  }
+
+  async connectionStatuses(): Promise<Array<Omit<ConnectionStatus, "provider">>> {
+    return (await this.listConnections()).map((connection) => ({
+      ...(connection.institution === undefined ? {} : { institution: connection.institution }),
+      ...(connection.country === undefined ? {} : { country: connection.country }),
+      state: connection.status === "UNAVAILABLE"
+        ? "unavailable"
+        : connection.status === "EXPIRED"
+          ? "expired"
+          : connection.status === "AUTHORIZED"
+            ? consentState(connection.validUntil)
+            : "needs_reconnect",
+      ...(connection.validUntil === undefined ? {} : { consentExpiresAt: connection.validUntil }),
+      ...(connection.accountCount === undefined ? {} : { accountCount: connection.accountCount }),
+    }));
   }
 
   async listInstitutions(filter: InstitutionFilter): Promise<string[]> {
@@ -391,6 +411,15 @@ export class EnableBankingClient implements FinanceReader {
     return this.accountsPromise;
   }
 
+  private session(sessionId: string): Promise<z.output<typeof sessionSchema>> {
+    let promise = this.sessionPromises.get(sessionId);
+    if (promise === undefined) {
+      promise = this.request(`/sessions/${encodeURIComponent(sessionId)}`).then((body) => sessionSchema.parse(body));
+      this.sessionPromises.set(sessionId, promise);
+    }
+    return promise;
+  }
+
   private async loadAuthorizedAccounts(): Promise<AuthorizedAccount[]> {
     const sessionIds = await this.sessions.list();
     if (sessionIds.length === 0) throw setupRequired();
@@ -398,9 +427,7 @@ export class EnableBankingClient implements FinanceReader {
     const sessions = await Promise.all(
       sessionIds.map(async (sessionId) => {
         try {
-          return sessionSchema.parse(
-            await this.request(`/sessions/${encodeURIComponent(sessionId)}`),
-          );
+          return await this.session(sessionId);
         } catch (error) {
           if (
             error instanceof PublicError &&

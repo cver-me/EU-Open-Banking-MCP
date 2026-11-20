@@ -31,14 +31,14 @@ Status key: ✅ equivalent · 🟡 filled, but differently or partly · ❌ not 
 | `referenceDate` | bank reference date | card last-statement date only | 🟡 | |
 | `lastChangedAt` | bank last-change time | — | ➖ | TrueLayer's `update_timestamp` is its own fetch time, not a bank change time |
 
-## Transactions (list, search, spending, cash flow)
+## Transactions (list, search and analysis tools)
 
 | MCP field | Enable Banking source | TrueLayer source | Status | Notes |
 | --- | --- | --- | --- | --- |
 | `amount` / `direction` | amount + `CRDT` / `DBIT` | absolute amount + `transaction_type` | ✅ | Card amounts are unsigned, so the type decides direction |
 | `status` | seven statuses | `booked` (settled) and `pending` | 🟡 | `held`, `cancelled`, `rejected`, `scheduled` do not exist in TrueLayer v1 |
 | `transactionDate` | bank transaction date | pending `timestamp`, as a Europe/London date | 🟡 | Timestamps are UTC instants |
-| `bookingDate` | booking date | settled `timestamp`, as a Europe/London date | 🟡 | A posting date, so spending marks it as inferred |
+| `bookingDate` | booking date | settled `timestamp`, as a Europe/London date | 🟡 | A posting date, used as a stand-in for the purchase date |
 | `valueDate` | value date | — | ❌ | |
 | `counterparty` | creditor or debtor name | `merchant_name`, then `meta.provider_merchant_name`, `meta.counter_party_preferred_name`, and (credits only) `meta.debtor_account_name` | ✅ | Banks fill different fields; some send the merchant only in `meta` |
 | `description` | remittance information + note | `description` + `meta.user_comments` | ✅ | |
@@ -59,7 +59,7 @@ Status key: ✅ equivalent · 🟡 filled, but differently or partly · ❌ not 
 | Account IDs after renewal | new IDs | bank-dependent; some banks keep them | ✅ | Clients should rediscover with `finance_list_accounts` |
 | History older than 90 days | bank-dependent | `sca_exceeded` stops paging with `historyUnavailable`; scans report `history_unavailable` | 🟡 | Some banks return empty results instead, which cannot be told apart from no activity |
 | Token refresh | — (stateless JWT) | refreshed per request when expired; any rotated refresh token is stored | 🟡 | Concurrent refreshes from separate requests are not serialized |
-| Provider failure | — | the other provider's accounts are still returned, with `providerErrors` | ✅ | Spending and cash flow add `provider_unavailable` |
+| Provider failure | — | the other provider's accounts are still returned, with `providerErrors` | ✅ | The analysis tools add `provider_unavailable` |
 
 ## Not available from TrueLayer
 

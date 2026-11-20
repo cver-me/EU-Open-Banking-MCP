@@ -58,6 +58,7 @@ describe("Aggregate", () => {
     getBalances: vi.fn(async () => ({ balances: [], errors: [] })),
     listTransactions: vi.fn(async () => ({ transactions: [] })),
     listAccountIds: vi.fn(async () => []),
+    connectionStatuses: vi.fn(async () => []),
     ...overrides,
   });
   const fake = (name: string, owns: (id: string) => boolean, overrides?: Partial<FinanceReader>) => {
